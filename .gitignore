@@ -1,0 +1,40 @@
+# Rust
+/target/
+**/*.rs.bk
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Runtime / local data (labels, model, logs, DB)
+/data/empty/*
+/data/full/*
+!/data/empty/.gitkeep
+!/data/full/.gitkeep
+/data/*.jpg
+/data/*.jpeg
+/data/*.png
+/data/*.avi
+/data/*.mp4
+/data/model.json
+/data/stats.json
+/data/*.jsonl
+/data/*.db
+/data/*.log
+/data/last_check.jpg
+/py/data/
+
+# Editor / OS
+.DS_Store
+*.swp
+.idea/
+.vscode/
+*.iml
+
+# Env / secrets
+.env
+.env.*
+*.pem

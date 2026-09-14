@@ -1,0 +1,64 @@
+camera:
+  width: 640
+  height: 480
+  fps: 10
+  device: 0
+  save_debug_video: false
+  debug_video_path: data/debug.avi
+
+level_roi:
+  x1: 100
+  y1: 50
+  x2: 540
+  y2: 450
+
+drop_roi:
+  x1: 280
+  y1: 40
+  x2: 380
+  y2: 160
+
+# true = top of LEVEL ROI is 100% (full), bottom is 0% (empty)
+level_full_at_top: true
+
+level:
+  empty_threshold: 5
+  critical_threshold: 20
+  low_threshold: 40
+  # hysteresis: leave LOW only above low_exit, leave CRITICAL only above critical_exit
+  low_exit: 42
+  critical_exit: 22
+  empty_exit: 8
+  smoothing_window: 15
+  ema_alpha: 0.25
+  min_confidence: 0.6
+  empty_confirmation_seconds: 10
+  blur_ksize: 5
+  sobel_peak_min: 8.0
+  method: sobel  # sobel | adaptive
+
+drop:
+  method: frame_diff  # frame_diff | mog2
+  cooldown_ms: 500
+  min_area: 15
+  max_area: 5000
+  min_confidence: 0.5
+  diff_threshold: 25
+  morph_ksize: 3
+  mog2_history: 120
+  mog2_var_threshold: 16
+
+alarm:
+  no_drop_warning_minutes: 5
+  no_drop_critical_minutes: 10
+  # above this level, long time without drops is OK (silo full / not feeding needed)
+  no_drop_ignore_above_percent: 60
+
+storage:
+  db_path: data/silo.db
+  # store level samples at most this often (seconds); events always stored
+  level_log_interval_seconds: 5
+
+logging:
+  level: INFO
+  file: data/silo.log
