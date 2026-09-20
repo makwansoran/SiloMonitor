@@ -216,7 +216,7 @@ impl App {
             None => silo_alert::play_voice(),
         };
         self.note = match result {
-            Ok(()) => "Played silo is empty".into(),
+            Ok(()) => "Transmitting…".into(),
             Err(e) => e,
         };
     }
@@ -360,6 +360,9 @@ impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         style(ctx);
         self.ensure_logo(ctx);
+        if let Some(msg) = silo_alert::take_status() {
+            self.note = msg;
+        }
         if self.dataset_dirty {
             self.refresh_samples();
         }

@@ -9,6 +9,7 @@ use rppal::gpio::{Gpio, OutputPin};
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::Mutex;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -20,14 +21,55 @@ const PCM_LEVEL: &str = "-28dB";
 /// The module needs time to key before it will modulate.
 const TX_LEAD_IN: Duration = Duration::from_millis(800);
 const TX_TAIL: Duration = Duration::from_millis(1200);
+/// Never hold the channel longer than this, whatever aplay does.
+const TX_MAX: Duration = Duration::from_secs(20);
 /// Re-announce while the silo stays empty so a busy channel still gets it.
 const REPEAT_EVERY: Duration = Duration::from_secs(90);
 
 static TX_BUSY: AtomicBool = AtomicBool::new(false);
 static PTT_PIN: AtomicU8 = AtomicU8::new(0);
+static STATUS: Mutex<Option<String>> = Mutex::new(None);
 
 pub fn set_ptt_pin(pin: u8) {
     PTT_PIN.store(pin, Ordering::SeqCst);
+}
+
+pub fn is_transmitting() -> bool {
+    TX_BUSY.load(Ordering::SeqCst)
+}
+
+/// Result of the last transmission, consumed once by the UI.
+pub fn take_status() -> Option<String> {
+    STATUS.lock().ok().and_then(|mut s| s.take())
+}
+
+fn set_status(msg: String) {
+    if let Ok(mut s) = STATUS.lock() {
+        *s = Some(msg);
+    }
+}
+
+fn open_ptt() -> Result<Option<OutputPin>, String> {
+    let pin = PTT_PIN.load(Ordering::SeqCst);
+    if pin == 0 {
+        return Ok(None);
+    }
+    let mut out = Gpio::new()
+        .and_then(|gpio| gpio.get(pin))
+        .map(|p| p.into_output_high())
+        .map_err(|e| format!("PTT GPIO{pin}: {e}"))?;
+    // Reset-on-drop restores whatever level the pin had before we claimed it.
+    // After an interrupted transmission that is low, which would re-key the
+    // radio the moment this handle drops, so release it explicitly instead.
+    out.set_reset_on_drop(false);
+    Ok(Some(out))
+}
+
+/// Undo a transmission that was interrupted before PTT could be released.
+pub fn release_ptt() {
+    if let Ok(Some(mut out)) = open_ptt() {
+        out.set_high();
+    }
 }
 
 /// Keys the transmitter for as long as it is alive.
@@ -35,19 +77,12 @@ struct Ptt(Option<OutputPin>);
 
 impl Ptt {
     fn key() -> Result<Self, String> {
-        let pin = PTT_PIN.load(Ordering::SeqCst);
-        if pin == 0 {
-            return Ok(Self(None));
+        let mut out = open_ptt()?;
+        if let Some(p) = out.as_mut() {
+            p.set_low();
+            thread::sleep(TX_LEAD_IN);
         }
-        let mut out = Gpio::new()
-            .and_then(|gpio| gpio.get(pin))
-            .map(|p| p.into_output_high())
-            .map_err(|e| format!("PTT GPIO{pin}: {e}"))?;
-        // Releasing the pin must not leave it low, which would key forever.
-        out.set_reset_on_drop(false);
-        out.set_low();
-        thread::sleep(TX_LEAD_IN);
-        Ok(Self(Some(out)))
+        Ok(Self(out))
     }
 
     /// False only when a pin is configured but did not actually go low.
@@ -73,6 +108,8 @@ pub struct SiloAlert {
 
 impl SiloAlert {
     pub fn new() -> Self {
+        // Recover the channel if a previous run died mid-transmission.
+        release_ptt();
         Self {
             was_empty: false,
             last_sent: None,
@@ -100,7 +137,7 @@ impl SiloAlert {
                 .last_sent
                 .map(|t| t.elapsed() >= REPEAT_EVERY)
                 .unwrap_or(true);
-        if !due || !transmit_in_background() {
+        if !due || !transmit() {
             return false;
         }
         self.last_sent = Some(Instant::now());
@@ -113,21 +150,19 @@ impl SiloAlert {
         true
     }
 
-    /// The Test radio button. Blocks so the UI can report the real result.
+    /// The Test radio button. Returns immediately; the real outcome arrives
+    /// through `take_status` so the window never freezes while keyed.
     pub fn test_transmit(&mut self) -> Result<(), String> {
-        if TX_BUSY
-            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-            .is_err()
-        {
-            return Err("Already transmitting".into());
+        if transmit() {
+            Ok(())
+        } else {
+            Err("Already transmitting".into())
         }
-        let result = play_voice();
-        TX_BUSY.store(false, Ordering::SeqCst);
-        result
     }
 }
 
-fn transmit_in_background() -> bool {
+/// Transmit on a worker thread. False if one is already running.
+fn transmit() -> bool {
     if TX_BUSY
         .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
         .is_err()
@@ -135,9 +170,14 @@ fn transmit_in_background() -> bool {
         return false;
     }
     thread::spawn(|| {
-        if let Err(e) = play_voice() {
-            eprintln!("radio: {e}");
-        }
+        let msg = match play_voice() {
+            Ok(()) => "Played silo is empty".to_string(),
+            Err(e) => {
+                eprintln!("radio: {e}");
+                e
+            }
+        };
+        set_status(msg);
         TX_BUSY.store(false, Ordering::SeqCst);
     });
     true
@@ -165,7 +205,7 @@ fn set_playback_level() {
     // Absolute path: the desktop session starts the app with a bare PATH.
     let _ = Command::new("/usr/bin/amixer")
         .args(["-c", "Headphones", "sset", "PCM", "--", PCM_LEVEL, "unmute"])
-        .status();
+        .output();
 }
 
 /// Key PTT, play the clip, unkey. Returns the first thing that actually failed.
@@ -181,17 +221,25 @@ pub fn play_voice() -> Result<(), String> {
         return Err("PTT did not go low".into());
     }
 
-    let played = Command::new("/usr/bin/aplay")
+    let mut child = Command::new("/usr/bin/aplay")
         .args(["-D", AUDIO_DEVICE, "-q"])
         .arg(&wav)
-        .output()
+        .spawn()
         .map_err(|e| format!("aplay: {e}"))?;
-    if !played.status.success() {
-        return Err(format!(
-            "aplay {}: {}",
-            played.status,
-            String::from_utf8_lossy(&played.stderr).trim()
-        ));
+
+    let deadline = Instant::now() + TX_MAX;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) if status.success() => return Ok(()),
+            Ok(Some(status)) => return Err(format!("aplay {status}")),
+            Ok(None) => {
+                if Instant::now() >= deadline {
+                    let _ = child.kill();
+                    return Err("aplay timed out".into());
+                }
+                thread::sleep(Duration::from_millis(50));
+            }
+            Err(e) => return Err(format!("aplay: {e}")),
+        }
     }
-    Ok(())
 }
