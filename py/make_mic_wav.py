@@ -1,9 +1,5 @@
 #!/usr/bin/env python3
-"""Build the VOX beep and the empty-silo clip.
-
-Stereo on purpose: bcm2835 Headphones accepts a 1-channel stream, and a mono
-file then drives only the tip. The SA828 mic wire may be on the ring.
-"""
+"""Build one continuous TX clip: beep + gap + silo is empty (stereo)."""
 
 from __future__ import annotations
 
@@ -14,12 +10,14 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 SRC = ROOT / "audio" / "silo_is_empty.wav"
+OUT = ROOT / "audio" / "silo_is_empty_vox.wav"
 BEEP = ROOT / "audio" / "vox_beep.wav"
-VOICE = ROOT / "audio" / "silo_is_empty_vox.wav"
 
-VOICE_SCALE = 0.6
-BEEP_AMP = 26000
-BEEP_S = 1.2
+VOICE_SCALE = 0.25
+BEEP_AMP = 12000
+BEEP_S = 0.5
+GAP_S = 0.35
+TAIL_S = 0.4
 
 
 def write_stereo(path: Path, rate: int, mono: array) -> None:
@@ -51,8 +49,17 @@ def main() -> None:
         "h",
         [int(BEEP_AMP * math.sin(2 * math.pi * 1000 * i / rate)) for i in range(n_beep)],
     )
+    gap = array("h", [0] * int(rate * GAP_S))
+    tail = array("h", [0] * int(rate * TAIL_S))
+
+    combined = array("h")
+    combined.extend(beep)
+    combined.extend(gap)
+    combined.extend(voice)
+    combined.extend(tail)
+
     write_stereo(BEEP, rate, beep)
-    write_stereo(VOICE, rate, voice)
+    write_stereo(OUT, rate, combined)
 
 
 if __name__ == "__main__":

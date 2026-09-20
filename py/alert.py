@@ -1,4 +1,4 @@
-"""Play the empty-silo clip on the Pi headphone jack. SA828 VOX keys TX."""
+"""Play the empty-silo clip on the Pi headphone jack. GPIO PTT keys TX."""
 
 from __future__ import annotations
 
@@ -11,7 +11,6 @@ log = logging.getLogger(__name__)
 
 AUDIO_DEVICE = "plughw:CARD=Headphones,DEV=0"
 ROOT = Path(__file__).resolve().parent.parent
-BEEP_FILE = ROOT / "audio" / "vox_beep.wav"
 VOICE_FILE = ROOT / "audio" / "silo_is_empty_vox.wav"
 COOLDOWN_S = 30.0
 
@@ -42,23 +41,13 @@ class SiloAlert:
         log.info("Alert played")
 
 
-def _pcm(level: str) -> None:
-    subprocess.run(
-        ["amixer", "-c", "Headphones", "sset", "PCM", "--", level, "unmute"],
-        check=False,
-        timeout=5,
-    )
-
-
 def play_voice() -> None:
     try:
-        _pcm("0dB")
-        if BEEP_FILE.is_file():
-            subprocess.run(
-                ["aplay", "-D", AUDIO_DEVICE, "-q", str(BEEP_FILE)],
-                check=False,
-                timeout=10,
-            )
+        subprocess.run(
+            ["amixer", "-c", "Headphones", "sset", "PCM", "--", "0dB", "unmute"],
+            check=False,
+            timeout=5,
+        )
         subprocess.run(
             ["aplay", "-D", AUDIO_DEVICE, "-q", str(VOICE_FILE)],
             check=False,

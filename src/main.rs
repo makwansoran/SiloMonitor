@@ -216,7 +216,7 @@ impl App {
             None => silo_alert::play_voice(),
         };
         self.note = match result {
-            Ok(()) => "Transmitting silo is empty".into(),
+            Ok(()) => "Played silo is empty".into(),
             Err(e) => e,
         };
     }
@@ -956,6 +956,22 @@ fn line_chart(ui: &mut egui::Ui, values: &[u32]) {
 fn main() -> eframe::Result {
     if std::env::var_os("WINIT_UNIX_BACKEND").is_none() {
         unsafe { std::env::set_var("WINIT_UNIX_BACKEND", "x11") };
+    }
+
+    // Headless check of the exact path the Test radio button uses.
+    if std::env::args().any(|a| a == "--test-radio") {
+        let cfg = Config::load();
+        silo_alert::set_ptt_pin(cfg.radio.ptt_gpio);
+        match silo_alert::play_voice() {
+            Ok(()) => {
+                println!("Played silo is empty");
+                std::process::exit(0);
+            }
+            Err(e) => {
+                eprintln!("Test radio failed: {e}");
+                std::process::exit(1);
+            }
+        }
     }
 
     let cam = match camera::Cam::open() {
