@@ -1,0 +1,59 @@
+#!/usr/bin/env python3
+"""Build the VOX beep and the empty-silo clip.
+
+Stereo on purpose: bcm2835 Headphones accepts a 1-channel stream, and a mono
+file then drives only the tip. The SA828 mic wire may be on the ring.
+"""
+
+from __future__ import annotations
+
+import math
+import wave
+from array import array
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+SRC = ROOT / "audio" / "silo_is_empty.wav"
+BEEP = ROOT / "audio" / "vox_beep.wav"
+VOICE = ROOT / "audio" / "silo_is_empty_vox.wav"
+
+VOICE_SCALE = 0.6
+BEEP_AMP = 26000
+BEEP_S = 1.2
+
+
+def write_stereo(path: Path, rate: int, mono: array) -> None:
+    stereo = array("h")
+    for s in mono:
+        stereo.extend((s, s))
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with wave.open(str(path), "wb") as o:
+        o.setnchannels(2)
+        o.setsampwidth(2)
+        o.setframerate(rate)
+        o.writeframes(stereo.tobytes())
+    print(f"wrote {path}  {len(mono) / rate:.2f}s  {rate} Hz  stereo")
+
+
+def main() -> None:
+    with wave.open(str(SRC), "rb") as w:
+        ch, sw, rate, n = w.getnchannels(), w.getsampwidth(), w.getframerate(), w.getnframes()
+        if ch != 1 or sw != 2:
+            raise SystemExit(f"Need mono 16-bit wav, got {ch}ch {sw}B")
+        voice = array("h")
+        voice.frombytes(w.readframes(n))
+
+    for i, s in enumerate(voice):
+        voice[i] = int(max(-32767, min(32767, s * VOICE_SCALE)))
+
+    n_beep = int(rate * BEEP_S)
+    beep = array(
+        "h",
+        [int(BEEP_AMP * math.sin(2 * math.pi * 1000 * i / rate)) for i in range(n_beep)],
+    )
+    write_stereo(BEEP, rate, beep)
+    write_stereo(VOICE, rate, voice)
+
+
+if __name__ == "__main__":
+    main()
