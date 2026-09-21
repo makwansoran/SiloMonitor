@@ -13,15 +13,15 @@ echo
 echo ">>> Put the SET cap ON now."
 read -r -p "SET cap is ON? Press Enter to factory-reset, then program 446.0062 MHz squelch 1..."
 
-sudo python3 "$ROOT/py/program_sa828.py" --factory
-sudo python3 "$ROOT/py/program_sa828.py" --freq 446.0062 --squelch 1
-sudo python3 "$ROOT/py/program_sa828.py" --read
+sudo python3 "$ROOT/tools/program_sa828.py" --factory
+sudo python3 "$ROOT/tools/program_sa828.py" --freq 446.0062 --squelch 1
+sudo python3 "$ROOT/tools/program_sa828.py" --read
 
 echo
 echo ">>> Take the SET cap OFF now."
 echo "Receiver is on 446.0062 squelch 1. Silent until the sender transmits."
 echo
 echo "Optional speaker check: SET ON, then:"
-echo "  sudo python3 py/program_sa828.py --freq 446.0062 --squelch 0"
+echo "  sudo python3 tools/program_sa828.py --freq 446.0062 --squelch 0"
 echo "  SET OFF → hiss. Then SET ON, run this script again (squelch 1), SET OFF."
 echo

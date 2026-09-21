@@ -1,0 +1,32 @@
+[Unit]
+Description=Spectr Vision — silo empty monitoring
+# The camera is USB and the desktop session owns the display, so wait for both.
+After=graphical.target dev-video0.device
+Wants=graphical.target
+
+[Service]
+Type=simple
+User=spectr
+WorkingDirectory=/home/spectr/silo-alert
+EnvironmentFile=-/home/spectr/silo-alert/.env
+Environment=DISPLAY=:0
+Environment=XDG_RUNTIME_DIR=/run/user/1000
+Environment=WINIT_UNIX_BACKEND=x11
+
+# Keep the panel awake: a blanked screen hides the operator UI.
+ExecStartPre=-/usr/bin/xset -display :0 s off
+ExecStartPre=-/usr/bin/xset -display :0 s noblank
+ExecStartPre=-/usr/bin/xset -display :0 -dpms
+
+ExecStart=/home/spectr/silo-alert/target/release/silo-alert
+
+# Watchdog: any exit, crash or clean, brings it straight back.
+Restart=always
+RestartSec=3
+StartLimitIntervalSec=0
+
+StandardOutput=append:/home/spectr/silo-alert/data/service.log
+StandardError=append:/home/spectr/silo-alert/data/service.log
+
+[Install]
+WantedBy=graphical.target

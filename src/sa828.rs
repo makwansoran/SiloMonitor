@@ -3,7 +3,6 @@ use std::path::Path;
 use std::thread;
 use std::time::Duration;
 
-pub const DEFAULT_FREQ: &str = "446.0062";
 /// Pi 4 hardware UART on GPIO14/15 (pins 8/10). Prefer serial0 over USB stick.
 const PORTS: [&str; 5] = [
     "/dev/serial0",

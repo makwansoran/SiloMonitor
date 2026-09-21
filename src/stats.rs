@@ -18,6 +18,12 @@ pub struct Stats {
     pub last_check_empty: Option<bool>,
     pub last_alert_unix: Option<u64>,
     pub started_unix: u64,
+    /// Confirmed-empty state, so a restart does not re-run the confirm delay.
+    #[serde(default)]
+    pub empty_state: bool,
+    /// When the silo first looked empty, for the same reason.
+    #[serde(default)]
+    pub empty_since_unix: Option<u64>,
 }
 
 impl Default for Stats {
@@ -34,6 +40,8 @@ impl Default for Stats {
             last_check_empty: None,
             last_alert_unix: None,
             started_unix: now_unix(),
+            empty_state: false,
+            empty_since_unix: None,
         }
     }
 }

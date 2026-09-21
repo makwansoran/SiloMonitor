@@ -12,3 +12,4 @@ serde_json = "1"
 serde_yaml = "0.9"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
 chrono = { version = "0.4.45", features = ["clock"] }
+ureq = { version = "2.12", default-features = false, features = ["tls", "json"] }

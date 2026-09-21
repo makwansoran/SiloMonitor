@@ -1,8 +1,0 @@
-.venv/
-data/*.db
-data/*.log
-data/*.avi
-data/synth_silo.mp4
-data/test_run.db
-__pycache__/
-*.pyc

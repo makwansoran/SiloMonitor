@@ -34,10 +34,6 @@ pub fn set_ptt_pin(pin: u8) {
     PTT_PIN.store(pin, Ordering::SeqCst);
 }
 
-pub fn is_transmitting() -> bool {
-    TX_BUSY.load(Ordering::SeqCst)
-}
-
 /// Result of the last transmission, consumed once by the UI.
 pub fn take_status() -> Option<String> {
     STATUS.lock().ok().and_then(|mut s| s.take())
