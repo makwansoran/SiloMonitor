@@ -110,13 +110,13 @@ impl Supabase {
         });
     }
 
-    pub fn push_check(&self, empty: bool, confidence: f32) {
+    pub fn push_event(&self, kind: &str, empty: Option<bool>, confidence: Option<f32>) {
         self.enqueue(EventRow {
             site_id: &self.site_id,
             ts: Some(now_rfc3339()),
-            kind: "check",
-            empty: Some(empty),
-            confidence: Some(confidence),
+            kind,
+            empty,
+            confidence,
             checks: None,
             empty_hits: None,
             alerts_sent: None,
@@ -125,11 +125,11 @@ impl Supabase {
         });
     }
 
-    pub fn push_stats(&self, stats: &Stats) {
+    pub fn push_heartbeat(&self, stats: &Stats) {
         self.enqueue(EventRow {
             site_id: &self.site_id,
             ts: Some(now_rfc3339()),
-            kind: "stats",
+            kind: "heartbeat",
             empty: stats.last_check_empty,
             confidence: None,
             checks: Some(stats.checks),

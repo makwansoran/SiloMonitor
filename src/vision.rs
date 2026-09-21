@@ -8,6 +8,8 @@ pub const SIZE: u32 = 32;
 pub const EMPTY_DIR: &str = "data/empty";
 /// The black-and-white version of each reference photo.
 pub const BW_DIR: &str = "data/empty_bw";
+pub const FULL_DIR: &str = "data/full";
+pub const ALERTS_DIR: &str = "data/alerts";
 pub const REGION_PATH: &str = "data/region.json";
 pub const REFERENCE_PATH: &str = "data/reference.json";
 
@@ -85,6 +87,14 @@ pub struct Reference {
     /// silo varies from one picture to the next.
     pub cohesion: f32,
     pub built_at_unix: u64,
+    /// Otsu split taken from the empty references, reused on live frames
+    /// so lighting swings do not redraw the black-and-white view.
+    #[serde(default = "default_bw_threshold")]
+    pub bw_threshold: u8,
+}
+
+fn default_bw_threshold() -> u8 {
+    128
 }
 
 impl Reference {
@@ -168,6 +178,8 @@ pub fn build_reference() -> Result<Reference, String> {
 
     let mut frames = Vec::new();
     let mut frames_bw = Vec::new();
+    let mut bw_threshold = default_bw_threshold();
+    let mut first = true;
     for meta in list_references() {
         let img = match image::open(&meta.path) {
             Ok(i) => i.to_rgb8(),
@@ -175,11 +187,15 @@ pub fn build_reference() -> Result<Reference, String> {
         };
         let (w, h) = img.dimensions();
         let rgb = img.into_raw();
+        if first {
+            bw_threshold = otsu_for(w, h, &rgb, roi);
+            first = false;
+        }
         frames.push(features_in_roi(w, h, &rgb, roi));
-        frames_bw.push(bw_features(w, h, &rgb, roi));
+        frames_bw.push(bw_features(w, h, &rgb, roi, Some(bw_threshold)));
 
         // Keep the saved black-and-white picture in step with the region.
-        let (bw, bh, pixels) = bw_from_rgb(w, h, &rgb, roi);
+        let (bw, bh, pixels) = bw_from_rgb(w, h, &rgb, roi, Some(bw_threshold));
         let bw_path = bw_path_for(&meta.file_name);
         let _ = save_rgb_jpeg(
             bw_path.to_str().unwrap_or("data/tmp_bw.jpg"),
@@ -219,6 +235,7 @@ pub fn build_reference() -> Result<Reference, String> {
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0),
+        bw_threshold,
     };
     reference.save()?;
     Ok(reference)
@@ -227,6 +244,8 @@ pub fn build_reference() -> Result<Reference, String> {
 pub fn ensure_dirs() {
     let _ = fs::create_dir_all(EMPTY_DIR);
     let _ = fs::create_dir_all(BW_DIR);
+    let _ = fs::create_dir_all(FULL_DIR);
+    let _ = fs::create_dir_all(ALERTS_DIR);
 }
 
 /// Split the picture into black and white at the threshold that best
@@ -265,7 +284,30 @@ fn otsu_split(gray: &[u8]) -> u8 {
 
 /// The high-contrast view of a frame: cropped to the region, pushed to pure
 /// black and white. Returned at crop resolution so it can be shown and saved.
-pub fn bw_from_rgb(w: u32, h: u32, rgb: &[u8], roi: Option<BoxNorm>) -> (u32, u32, Vec<u8>) {
+fn otsu_for(w: u32, h: u32, rgb: &[u8], roi: Option<BoxNorm>) -> u8 {
+    let img: RgbImage = ImageBuffer::from_raw(w, h, rgb.to_vec())
+        .unwrap_or_else(|| RgbImage::new(w.max(1), h.max(1)));
+    let view = match roi {
+        Some(b) if w > 1 && h > 1 => {
+            let (x1, y1, x2, y2) = b.to_px(w, h);
+            image::imageops::crop_imm(&img, x1, y1, x2 - x1, y2 - y1).to_image()
+        }
+        _ => img,
+    };
+    let gray: Vec<u8> = view
+        .pixels()
+        .map(|Rgb([r, g, b])| (0.299 * *r as f32 + 0.587 * *g as f32 + 0.114 * *b as f32) as u8)
+        .collect();
+    otsu_split(&gray)
+}
+
+pub fn bw_from_rgb(
+    w: u32,
+    h: u32,
+    rgb: &[u8],
+    roi: Option<BoxNorm>,
+    threshold: Option<u8>,
+) -> (u32, u32, Vec<u8>) {
     let img: RgbImage = ImageBuffer::from_raw(w, h, rgb.to_vec())
         .unwrap_or_else(|| RgbImage::new(w.max(1), h.max(1)));
     let view = match roi {
@@ -282,7 +324,7 @@ pub fn bw_from_rgb(w: u32, h: u32, rgb: &[u8], roi: Option<BoxNorm>) -> (u32, u3
             (0.299 * *r as f32 + 0.587 * *g as f32 + 0.114 * *b as f32) as u8
         })
         .collect();
-    let t = otsu_split(&gray);
+    let t = threshold.unwrap_or_else(|| otsu_split(&gray));
     let mut out = Vec::with_capacity(gray.len() * 3);
     for g in gray {
         let v = if g > t { 255u8 } else { 0u8 };
@@ -321,8 +363,14 @@ pub fn thumb_from_rgb(
 }
 
 /// The black-and-white view reduced to the 32×32 signature used for matching.
-pub fn bw_features(w: u32, h: u32, rgb: &[u8], roi: Option<BoxNorm>) -> Vec<f32> {
-    let (bw, bh, pixels) = bw_from_rgb(w, h, rgb, roi);
+pub fn bw_features(
+    w: u32,
+    h: u32,
+    rgb: &[u8],
+    roi: Option<BoxNorm>,
+    threshold: Option<u8>,
+) -> Vec<f32> {
+    let (bw, bh, pixels) = bw_from_rgb(w, h, rgb, roi, threshold);
     // No roi here: bw_from_rgb already cropped.
     features_in_roi(bw, bh, &pixels, None)
 }
@@ -342,7 +390,22 @@ pub fn features_in_roi(w: u32, h: u32, rgb: &[u8], roi: Option<BoxNorm>) -> Vec<
         let Rgb([r, g, b]) = *p;
         out.push((0.299 * r as f32 + 0.587 * g as f32 + 0.114 * b as f32) / 255.0);
     }
+    normalize_hist(&mut out);
     out
+}
+
+/// Stretch contrast so a darker afternoon still matches a morning empty photo.
+fn normalize_hist(feat: &mut [f32]) {
+    let mut min = 1.0f32;
+    let mut max = 0.0f32;
+    for &v in feat.iter() {
+        min = min.min(v);
+        max = max.max(v);
+    }
+    let range = (max - min).max(1e-4);
+    for v in feat.iter_mut() {
+        *v = (*v - min) / range;
+    }
 }
 
 pub fn save_rgb_jpeg(path: &str, w: u32, h: u32, rgb: &[u8]) -> Result<(), String> {
@@ -367,7 +430,7 @@ pub fn save_reference_photo(w: u32, h: u32, rgb: &[u8]) -> Result<PathBuf, Strin
     save_rgb_jpeg(path.to_str().unwrap_or("data/tmp.jpg"), w, h, rgb)?;
 
     let roi = load_region();
-    let (bw, bh, pixels) = bw_from_rgb(w, h, rgb, roi);
+    let (bw, bh, pixels) = bw_from_rgb(w, h, rgb, roi, None);
     let bw_path = bw_path_for(&name);
     save_rgb_jpeg(
         bw_path.to_str().unwrap_or("data/tmp_bw.jpg"),
@@ -377,6 +440,96 @@ pub fn save_reference_photo(w: u32, h: u32, rgb: &[u8]) -> Result<PathBuf, Strin
     )?;
 
     Ok(path)
+}
+
+/// A photo of the silo when it is not empty — used only to estimate
+/// how close a full view can get to the empty threshold.
+pub fn save_full_photo(w: u32, h: u32, rgb: &[u8]) -> Result<PathBuf, String> {
+    ensure_dirs();
+    let ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let name = format!("{ts}.jpg");
+    let path = PathBuf::from(FULL_DIR).join(&name);
+    save_rgb_jpeg(path.to_str().unwrap_or("data/tmp_full.jpg"), w, h, rgb)?;
+    Ok(path)
+}
+
+pub fn list_full_samples() -> Vec<SampleMeta> {
+    ensure_dirs();
+    let mut out = samples_in(FULL_DIR, Some(false));
+    out.sort_by(|a, b| {
+        b.captured_ms
+            .cmp(&a.captured_ms)
+            .then(b.file_name.cmp(&a.file_name))
+    });
+    out
+}
+
+/// How close the nearest full sample sits to the empty alert line.
+/// None when there are no full samples. 0 = safely below, 1 = would trip.
+pub fn false_empty_risk(reference: &Reference, threshold: f32) -> Option<f32> {
+    let fulls = list_full_samples();
+    if fulls.is_empty() {
+        return None;
+    }
+    let mut worst = 0.0f32;
+    for meta in fulls {
+        let img = match image::open(&meta.path) {
+            Ok(i) => i.to_rgb8(),
+            Err(_) => continue,
+        };
+        let (w, h) = img.dimensions();
+        let rgb = img.into_raw();
+        let feat = features_in_roi(w, h, &rgb, reference.roi);
+        let feat_bw = bw_features(w, h, &rgb, reference.roi, Some(reference.bw_threshold));
+        worst = worst.max(reference.similarity_pair(&feat, &feat_bw));
+    }
+    Some(((worst - (threshold - 0.08)) / 0.16).clamp(0.0, 1.0))
+}
+
+pub fn save_alert_evidence(
+    w: u32,
+    h: u32,
+    rgb: &[u8],
+    roi: Option<BoxNorm>,
+    unix: u64,
+    match_score: f32,
+    threshold: f32,
+    streak: u32,
+) -> Result<PathBuf, String> {
+    ensure_dirs();
+    let (tw, th, pixels) = thumb_from_rgb(w, h, rgb, roi, 320);
+    let jpg = PathBuf::from(ALERTS_DIR).join(format!("{unix}.jpg"));
+    save_rgb_jpeg(jpg.to_str().unwrap_or("data/tmp_alert.jpg"), tw, th, &pixels)?;
+    let meta = serde_json::json!({
+        "unix": unix,
+        "match": match_score,
+        "threshold": threshold,
+        "streak": streak,
+    });
+    let json = PathBuf::from(ALERTS_DIR).join(format!("{unix}.json"));
+    fs::write(&json, serde_json::to_string_pretty(&meta).unwrap_or_default())
+        .map_err(|e| e.to_string())?;
+    Ok(jpg)
+}
+
+/// Newest alert evidence jpeg, if any.
+pub fn latest_alert_evidence() -> Option<PathBuf> {
+    let rd = fs::read_dir(ALERTS_DIR).ok()?;
+    let mut best: Option<(u64, PathBuf)> = None;
+    for e in rd.filter_map(|e| e.ok()) {
+        let path = e.path();
+        if path.extension().and_then(|x| x.to_str()) != Some("jpg") {
+            continue;
+        }
+        let stem = path.file_stem().and_then(|s| s.to_str())?.parse::<u64>().ok()?;
+        if best.as_ref().map(|(t, _)| stem > *t).unwrap_or(true) {
+            best = Some((stem, path));
+        }
+    }
+    best.map(|(_, p)| p)
 }
 
 /// The black-and-white twin of a stored reference photo.
@@ -418,7 +571,7 @@ pub fn delete_sample(path: &Path) -> Result<(), String> {
         .canonicalize()
         .map_err(|e| format!("resolve image: {e}"))?;
     let mut ok = false;
-    for dir in [EMPTY_DIR] {
+    for dir in [EMPTY_DIR, FULL_DIR] {
         if let Ok(root) = Path::new(dir).canonicalize() {
             if canon.starts_with(&root) {
                 ok = true;

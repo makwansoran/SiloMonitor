@@ -19,26 +19,25 @@ pub struct Config {
     pub source_path: Option<PathBuf>,
 }
 
-/// Where frames come from. The site camera is an Ethernet/RTSP unit; USB is
-/// kept for bench work on a laptop.
+/// Ethernet camera on the plant network.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct CameraCfg {
-    /// "rtsp" or "usb". Empty string picks rtsp when a url is set.
-    #[serde(default)]
+    #[serde(default = "default_cam_source")]
     pub source: String,
     #[serde(default)]
     pub rtsp_url: String,
-    #[serde(default)]
-    pub device: u32,
     #[serde(default = "default_cam_w")]
     pub width: u32,
     #[serde(default = "default_cam_h")]
     pub height: u32,
-    /// Decode rate. Low is fine: the model only looks every check interval.
+    /// Decode rate. Low is fine: the match only runs each check interval.
     #[serde(default = "default_cam_fps")]
     pub fps: u32,
 }
 
+fn default_cam_source() -> String {
+    "rtsp".into()
+}
 fn default_cam_w() -> u32 {
     640
 }
@@ -52,22 +51,11 @@ fn default_cam_fps() -> u32 {
 impl Default for CameraCfg {
     fn default() -> Self {
         Self {
-            source: String::new(),
+            source: default_cam_source(),
             rtsp_url: String::new(),
-            device: 0,
             width: default_cam_w(),
             height: default_cam_h(),
             fps: default_cam_fps(),
-        }
-    }
-}
-
-impl CameraCfg {
-    pub fn is_rtsp(&self) -> bool {
-        match self.source.trim().to_ascii_lowercase().as_str() {
-            "rtsp" => true,
-            "usb" => false,
-            _ => !self.rtsp_url.trim().is_empty(),
         }
     }
 }
@@ -114,23 +102,42 @@ impl Default for StorageCfg {
 pub struct RadioCfg {
     #[serde(default = "default_freq")]
     pub frequency_mhz: String,
+    /// Peltor LiteCom Pro III analog channel 1–16. Drives frequency_mhz.
+    #[serde(default = "default_channel")]
+    pub channel: u8,
     #[serde(default = "default_squelch")]
     pub squelch: u8,
+    /// CTCSS: 0 = Off, 1–38 = standard tone (same TX/RX on SA828).
+    #[serde(default)]
+    pub ctcss: u8,
     /// Pi hardware UART: /dev/serial0 (GPIO14 TX / GPIO15 RX).
     #[serde(default = "default_uart_port", alias = "usb_port")]
     pub uart_port: String,
     /// BCM pin wired to SA828 PTT (pin 20). 0 = disable GPIO PTT.
     #[serde(default = "default_ptt_gpio")]
     pub ptt_gpio: u8,
+    #[serde(default = "default_audio_device")]
+    pub audio_device: String,
+    /// PCM playback into the SA828 mic, dB. Default −28 keeps the mic clean.
+    #[serde(default = "default_pcm_db")]
+    pub pcm_db: i8,
+    /// Laptop (no GPIO) defaults muted so a bench run never keys a radio.
+    #[serde(default = "default_muted")]
+    pub muted: bool,
 }
 
 impl Default for RadioCfg {
     fn default() -> Self {
         Self {
             frequency_mhz: default_freq(),
+            channel: default_channel(),
             squelch: default_squelch(),
+            ctcss: 0,
             uart_port: default_uart_port(),
             ptt_gpio: default_ptt_gpio(),
+            audio_device: default_audio_device(),
+            pcm_db: default_pcm_db(),
+            muted: default_muted(),
         }
     }
 }
@@ -143,12 +150,28 @@ fn default_freq() -> String {
     "446.0062".into()
 }
 
+fn default_channel() -> u8 {
+    1
+}
+
 fn default_squelch() -> u8 {
     1
 }
 
 fn default_uart_port() -> String {
     "/dev/serial0".into()
+}
+
+fn default_audio_device() -> String {
+    "plughw:CARD=Headphones,DEV=0".into()
+}
+
+fn default_pcm_db() -> i8 {
+    -28
+}
+
+fn default_muted() -> bool {
+    !Path::new("/dev/gpiomem").exists() && !Path::new("/dev/gpiochip0").exists()
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -179,8 +202,12 @@ fn default_site() -> String {
     "spectr-pi".into()
 }
 
-fn d15f() -> f32 { 15.0 }
-fn default_db() -> String { "data/silo.db".into() }
+fn d15f() -> f32 {
+    15.0
+}
+fn default_db() -> String {
+    "data/silo.db".into()
+}
 
 impl Config {
     pub fn load() -> Self {
@@ -203,15 +230,16 @@ impl Config {
     }
 
     fn default_builtin() -> Self {
-        let mut c: Config = serde_yaml::from_str(include_str!("../config.yaml"))
-            .unwrap_or_else(|_| Config {
+        let mut c: Config = serde_yaml::from_str(include_str!("../config.yaml")).unwrap_or_else(
+            |_| Config {
                 camera: CameraCfg::default(),
                 level: LevelCfg::default(),
                 storage: StorageCfg::default(),
                 radio: RadioCfg::default(),
                 supabase: SupabaseCfg::default(),
                 source_path: None,
-            });
+            },
+        );
         c.source_path = Some(PathBuf::from("/home/spectr/silo-alert/config.yaml"));
         c
     }
@@ -239,13 +267,14 @@ impl Config {
         if let Some(cam) = doc.get_mut("camera") {
             cam["source"] = self.camera.source.clone().into();
             cam["rtsp_url"] = self.camera.rtsp_url.clone().into();
-            cam["device"] = self.camera.device.into();
+            if let Some(map) = cam.as_mapping_mut() {
+                map.remove(serde_yaml::Value::from("device"));
+            }
             cam["width"] = self.camera.width.into();
             cam["height"] = self.camera.height.into();
             cam["fps"] = self.camera.fps.into();
         } else {
-            doc["camera"] =
-                serde_yaml::to_value(&self.camera).unwrap_or(serde_yaml::Value::Null);
+            doc["camera"] = serde_yaml::to_value(&self.camera).unwrap_or(serde_yaml::Value::Null);
         }
         if let Some(sb) = doc.get_mut("supabase") {
             sb["enabled"] = serde_yaml::Value::Bool(self.supabase.enabled);

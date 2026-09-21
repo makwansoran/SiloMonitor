@@ -7,6 +7,7 @@ HOST="${1:-spectr@spectr.local}"
 
 echo "==> Reminder: run sql/supabase_silo.sql in Supabase SQL Editor if not done yet"
 echo "    File: $ROOT/sql/supabase_silo.sql"
+echo "    Camera is Ethernet/RTSP — set camera.rtsp_url and install ffmpeg on the Pi."
 echo
 
 if [[ ! -f "$ROOT/.env" ]]; then

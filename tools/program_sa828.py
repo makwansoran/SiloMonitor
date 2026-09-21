@@ -24,9 +24,11 @@ def normalize(raw: str) -> str:
     return f"{f:.4f}"
 
 
-def payload(freq: str, squelch: int) -> str:
+def payload(freq: str, squelch: int, ctcss: int = 0) -> str:
+    if ctcss not in range(39):
+        raise SystemExit("CTCSS must be 0–38 (0=Off)")
     pairs = ",".join(f"{freq},{freq}" for _ in range(16))
-    return f"{pairs},000,000,{squelch}"
+    return f"{pairs},{ctcss:03d},{ctcss:03d},{squelch}"
 
 
 def detect_port() -> str:
@@ -95,19 +97,24 @@ def factory(port: str) -> None:
     print(raw.strip())
 
 
-def program(port: str, freq: str, squelch: int) -> None:
+def program(port: str, freq: str, squelch: int, ctcss: int = 0) -> None:
     freq = normalize(freq)
     if squelch not in range(9):
         raise SystemExit("Squelch must be 0–8")
+    if ctcss not in range(39):
+        raise SystemExit("CTCSS must be 0–38 (0=Off)")
     ser = open_port(port)
     try:
         read_config(ser)
-        require_reply("set", chat(ser, f"AAFA3{payload(freq, squelch)}\r\n".encode("ascii"), 2.5))
+        require_reply(
+            "set",
+            chat(ser, f"AAFA3{payload(freq, squelch, ctcss)}\r\n".encode("ascii"), 2.5),
+        )
         raw = read_config(ser)
     finally:
         ser.close()
     print(f"Module programmed  ({port})")
-    print(f"  requested: {freq} MHz  squelch {squelch}")
+    print(f"  requested: {freq} MHz  squelch {squelch}  CTCSS {ctcss}")
     print(f"  channel 1: {parse_ch1(raw)}")
     print("Take the SET cap OFF to run / listen.")
     if squelch == 0:
@@ -178,6 +185,12 @@ def main() -> None:
     p.add_argument("--port", help="USB serial device (default: first ttyUSB/ttyACM)")
     p.add_argument("--freq", default=DEFAULT_FREQ, help="MHz, e.g. 446.0062")
     p.add_argument("--squelch", type=int, default=1, help="0=always hiss (test speaker), 1–8=normal")
+    p.add_argument(
+        "--ctcss",
+        type=int,
+        default=0,
+        help="CTCSS 0=Off, 1–38 = tone (same TX/RX)",
+    )
     p.add_argument("--read", action="store_true", help="Read current frequency only")
     p.add_argument(
         "--factory",
@@ -197,7 +210,7 @@ def main() -> None:
     elif args.read:
         read(port)
     else:
-        program(port, args.freq, args.squelch)
+        program(port, args.freq, args.squelch, args.ctcss)
 
 
 if __name__ == "__main__":

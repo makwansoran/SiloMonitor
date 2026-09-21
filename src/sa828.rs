@@ -3,6 +3,8 @@ use std::path::Path;
 use std::thread;
 use std::time::Duration;
 
+use crate::peltor;
+
 /// Pi 4 hardware UART on GPIO14/15 (pins 8/10). Prefer serial0 over USB stick.
 const PORTS: [&str; 5] = [
     "/dev/serial0",
@@ -27,10 +29,13 @@ pub fn clamp_squelch(s: u8) -> u8 {
 }
 
 /// AAFA protocol over the Pi hardware UART (SA828 TXD↔Pi RXD, RXD↔Pi TXD).
-pub fn program(freq: &str, squelch: u8, port: &str) -> Result<String, String> {
+///
+/// `ctcss` is 0 = Off, 1–38 = standard tone (same on TX and RX).
+pub fn program(freq: &str, squelch: u8, ctcss: u8, port: &str) -> Result<String, String> {
     let freq = normalize_freq(freq)?;
     let sq = clamp_squelch(squelch);
-    let cmd = format!("AAFA3{}\r\n", set_payload(&freq, sq));
+    let tone = peltor::clamp_ctcss(ctcss);
+    let cmd = format!("AAFA3{}\r\n", set_payload(&freq, sq, tone));
     let path = pick_port(port)?;
     chat(&path, b"AAFAA\r\n", 600)?;
     let set = chat(&path, cmd.as_bytes(), 2500)?;
@@ -38,8 +43,9 @@ pub fn program(freq: &str, squelch: u8, port: &str) -> Result<String, String> {
         return Err(format!("module rejected set: {set}"));
     }
     let info = read_on(&path)?;
+    let tone_lbl = peltor::ctcss_label(tone);
     Ok(format!(
-        "UART programmed {path}\n  {freq} MHz  squelch {sq}\n  {info}"
+        "UART programmed {path}\n  {freq} MHz  squelch {sq}  CTCSS {tone_lbl}\n  {info}"
     ))
 }
 
@@ -65,12 +71,12 @@ fn pick_port(preferred: &str) -> Result<String, String> {
     )
 }
 
-fn set_payload(freq: &str, squelch: u8) -> String {
+fn set_payload(freq: &str, squelch: u8, ctcss: u8) -> String {
     let mut pairs = Vec::with_capacity(16);
     for _ in 0..16 {
         pairs.push(format!("{freq},{freq}"));
     }
-    format!("{},000,000,{squelch}", pairs.join(","))
+    format!("{},{ctcss:03},{ctcss:03},{squelch}", pairs.join(","))
 }
 
 fn open_uart(path: &str) -> Result<Uart, String> {

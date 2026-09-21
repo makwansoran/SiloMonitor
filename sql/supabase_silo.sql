@@ -11,11 +11,20 @@ drop table if exists silo_alerts cascade;
 drop table if exists silo_checks cascade;
 drop table if exists silo_stats cascade;
 
+create table if not exists silo_allowed_sites (
+  site_id text primary key
+);
+
+insert into silo_allowed_sites (site_id)
+values ('spectr-pi')
+on conflict (site_id) do nothing;
+
 create table if not exists silo_events (
   id bigint generated always as identity primary key,
   site_id text not null default 'spectr-pi',
   ts timestamptz not null default now(),
-  -- empty_alert | check | stats
+  -- empty_alert | heartbeat | camera_down | camera_up | radio_tx | radio_fail
+  -- app_start | armed | disarmed
   kind text not null,
   empty boolean,
   confidence real,
@@ -31,17 +40,27 @@ create index if not exists silo_events_site_ts on silo_events (site_id, ts desc)
 create index if not exists silo_events_kind on silo_events (kind, ts desc);
 
 alter table silo_events enable row level security;
+alter table silo_allowed_sites enable row level security;
 
 drop policy if exists "anon insert events" on silo_events;
 drop policy if exists "anon select events" on silo_events;
+drop policy if exists "anon select sites" on silo_allowed_sites;
 
 create policy "anon insert events" on silo_events
-  for insert to anon, authenticated with check (true);
+  for insert to anon, authenticated
+  with check (site_id in (select site_id from silo_allowed_sites));
+
 create policy "anon select events" on silo_events
-  for select to anon, authenticated using (true);
+  for select to anon, authenticated
+  using (site_id in (select site_id from silo_allowed_sites));
+
+create policy "anon select sites" on silo_allowed_sites
+  for select to anon, authenticated
+  using (true);
 
 grant usage on schema public to anon, authenticated;
 grant insert, select on table public.silo_events to anon, authenticated;
+grant select on table public.silo_allowed_sites to anon, authenticated;
 
 do $$
 declare

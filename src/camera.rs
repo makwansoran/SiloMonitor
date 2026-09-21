@@ -1,73 +1,34 @@
-//! Frame sources: an Ethernet/RTSP camera on site, USB for bench work.
+//! Ethernet/RTSP camera for the plant.
 //!
-//! RTSP goes through a long-lived `ffmpeg` process that decodes straight to
-//! raw RGB at a low frame rate. A Pi 4 handles that comfortably, and the
-//! decode never blocks the UI because a worker thread owns the pipe.
+//! A long-lived `ffmpeg` process decodes to raw RGB at a low frame rate.
+//! The UI never blocks: a worker thread owns the pipe.
 
 use crate::config::CameraCfg;
-use nokhwa::pixel_format::RgbFormat;
-use nokhwa::utils::{
-    CameraFormat, CameraIndex, FrameFormat, RequestedFormat, RequestedFormatType, Resolution,
-};
-use nokhwa::Camera;
 use std::io::Read;
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
-pub enum Cam {
-    Usb(Box<Camera>),
-    Rtsp(RtspCam),
+pub struct Cam {
+    inner: RtspCam,
 }
 
 impl Cam {
     pub fn open(cfg: &CameraCfg) -> Result<Self, String> {
-        if cfg.is_rtsp() {
-            let url = cfg.rtsp_url.trim();
-            if url.is_empty() {
-                return Err("camera source is rtsp but rtsp_url is empty".into());
-            }
-            RtspCam::open(url, cfg.width, cfg.height, cfg.fps).map(Cam::Rtsp)
-        } else {
-            Self::open_usb(cfg).map_err(|e| e.to_string())
+        let url = cfg.rtsp_url.trim();
+        if url.is_empty() {
+            return Err("RTSP URL is empty — set the Ethernet camera address".into());
         }
-    }
-
-    fn open_usb(cfg: &CameraCfg) -> Result<Self, nokhwa::NokhwaError> {
-        // Asking for the absolute highest resolution overloads the Pi.
-        let want = CameraFormat::new(
-            Resolution::new(cfg.width.max(160), cfg.height.max(120)),
-            FrameFormat::MJPEG,
-            15,
-        );
-        let req = RequestedFormat::new::<RgbFormat>(RequestedFormatType::Closest(want));
-        let mut cam = Camera::new(CameraIndex::Index(cfg.device), req)?;
-        cam.open_stream()?;
-        let fmt = cam.camera_format();
-        eprintln!(
-            "camera: usb {}x{} @ {} fps ({:?})",
-            fmt.resolution().width(),
-            fmt.resolution().height(),
-            fmt.frame_rate(),
-            fmt.format()
-        );
-        Ok(Cam::Usb(Box::new(cam)))
+        RtspCam::open(url, cfg.width, cfg.height, cfg.fps).map(|inner| Cam { inner })
     }
 
     pub fn frame(&mut self) -> Option<(u32, u32, Vec<u8>)> {
-        match self {
-            Cam::Usb(cam) => {
-                let f = cam.frame().ok()?;
-                let rgb = f.decode_image::<RgbFormat>().ok()?;
-                Some((rgb.width(), rgb.height(), rgb.into_raw()))
-            }
-            Cam::Rtsp(cam) => cam.frame(),
-        }
+        self.inner.frame()
     }
 }
 
-pub struct RtspCam {
+struct RtspCam {
     width: u32,
     height: u32,
     latest: Arc<Mutex<Option<Vec<u8>>>>,
@@ -86,12 +47,10 @@ impl RtspCam {
                 "-nostdin",
                 "-loglevel",
                 "error",
-                // TCP survives lossy links far better than the UDP default.
                 "-rtsp_transport",
                 "tcp",
                 "-rtsp_flags",
                 "prefer_tcp",
-                // Drop stale frames instead of building latency.
                 "-fflags",
                 "nobuffer",
                 "-flags",
@@ -136,7 +95,6 @@ impl RtspCam {
                         }
                     }
                     Err(_) => {
-                        // Stream ended: the supervisor in main reopens us.
                         running.store(false, Ordering::SeqCst);
                         return;
                     }

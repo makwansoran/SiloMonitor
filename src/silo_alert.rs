@@ -8,35 +8,66 @@
 use rppal::gpio::{Gpio, OutputPin};
 use std::path::PathBuf;
 use std::process::Command;
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI8, AtomicU8, Ordering};
 use std::sync::Mutex;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-const AUDIO_DEVICE: &str = "plughw:CARD=Headphones,DEV=0";
+const DEFAULT_AUDIO: &str = "plughw:CARD=Headphones,DEV=0";
 const VOICE_REL: &str = "audio/silo_is_empty_vox.wav";
 const INSTALL_DIR: &str = "/home/spectr/silo-alert";
-/// The jack drives a ~10 mV mic input; louder than this transmits as hiss.
-const PCM_LEVEL: &str = "-28dB";
+/// Safe default: the jack drives a ~10 mV mic input; louder transmits as hiss.
+const DEFAULT_PCM_DB: i8 = -28;
 /// The module needs time to key before it will modulate.
 const TX_LEAD_IN: Duration = Duration::from_millis(800);
 const TX_TAIL: Duration = Duration::from_millis(1200);
 /// Never hold the channel longer than this, whatever aplay does.
 const TX_MAX: Duration = Duration::from_secs(20);
 /// Re-announce while the silo stays empty so a busy channel still gets it.
-const REPEAT_EVERY: Duration = Duration::from_secs(90);
+pub const REPEAT_EVERY: Duration = Duration::from_secs(90);
 
 static TX_BUSY: AtomicBool = AtomicBool::new(false);
 static PTT_PIN: AtomicU8 = AtomicU8::new(0);
+static MUTED: AtomicBool = AtomicBool::new(false);
+static PCM_DB: AtomicI8 = AtomicI8::new(DEFAULT_PCM_DB);
+static AUDIO_DEVICE: Mutex<String> = Mutex::new(String::new());
 static STATUS: Mutex<Option<String>> = Mutex::new(None);
 
 pub fn set_ptt_pin(pin: u8) {
     PTT_PIN.store(pin, Ordering::SeqCst);
 }
 
+pub fn set_audio_device(dev: &str) {
+    if let Ok(mut g) = AUDIO_DEVICE.lock() {
+        *g = dev.trim().to_string();
+    }
+}
+
+pub fn set_muted(muted: bool) {
+    MUTED.store(muted, Ordering::SeqCst);
+}
+
+/// PCM playback level in dB for amixer (typical useful range about −40…0).
+pub fn set_pcm_db(db: i8) {
+    PCM_DB.store(db.clamp(-60, 0), Ordering::SeqCst);
+}
+
+fn audio_device() -> String {
+    AUDIO_DEVICE
+        .lock()
+        .ok()
+        .map(|g| g.clone())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| DEFAULT_AUDIO.to_string())
+}
+
 /// Result of the last transmission, consumed once by the UI.
 pub fn take_status() -> Option<String> {
     STATUS.lock().ok().and_then(|mut s| s.take())
+}
+
+pub fn status_ok(msg: &str) -> bool {
+    msg.starts_with("Played")
 }
 
 fn set_status(msg: String) {
@@ -113,41 +144,56 @@ impl SiloAlert {
         }
     }
 
-    pub fn restore_last_alert_unix(&mut self, unix: Option<u64>) {
-        self.last_sent_unix = unix;
+    /// Carry empty + last TX across a restart so we do not re-blast the plant.
+    pub fn restore(&mut self, was_empty: bool, last_alert_unix: Option<u64>) {
+        self.was_empty = was_empty;
+        self.last_sent_unix = last_alert_unix;
+        self.last_sent = Some(Instant::now());
     }
 
     pub fn last_alert_unix(&self) -> Option<u64> {
         self.last_sent_unix
     }
 
+    /// Seconds until the next re-announce, if the silo is still empty.
+    pub fn next_repeat_in(&self) -> Option<u64> {
+        let last = self.last_sent_unix?;
+        let now = now_unix();
+        let every = REPEAT_EVERY.as_secs();
+        Some(every.saturating_sub(now.saturating_sub(last)))
+    }
+
     /// Announce when the silo turns empty, then repeat while it stays empty.
+    ///
+    /// A restored already-empty state is not "became empty" — only the 90s
+    /// wall-clock cooldown may fire again.
     pub fn update(&mut self, empty: bool) -> bool {
         let became_empty = empty && !self.was_empty;
         self.was_empty = empty;
         if !empty {
             return false;
         }
-        let due = became_empty
-            || self
-                .last_sent
-                .map(|t| t.elapsed() >= REPEAT_EVERY)
-                .unwrap_or(true);
+        if MUTED.load(Ordering::SeqCst) {
+            return false;
+        }
+        let due = if became_empty {
+            true
+        } else if let Some(u) = self.last_sent_unix {
+            now_unix().saturating_sub(u) >= REPEAT_EVERY.as_secs()
+        } else {
+            false
+        };
         if !due || !transmit() {
             return false;
         }
         self.last_sent = Some(Instant::now());
-        self.last_sent_unix = Some(
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map(|d| d.as_secs())
-                .unwrap_or(0),
-        );
+        self.last_sent_unix = Some(now_unix());
         true
     }
 
     /// The Test radio button. Returns immediately; the real outcome arrives
     /// through `take_status` so the window never freezes while keyed.
+    /// Test ignores mute so the operator can still prove the radio.
     pub fn test_transmit(&mut self) -> Result<(), String> {
         if transmit() {
             Ok(())
@@ -155,6 +201,13 @@ impl SiloAlert {
             Err("Already transmitting".into())
         }
     }
+}
+
+fn now_unix() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 /// Transmit on a worker thread. False if one is already running.
@@ -185,7 +238,6 @@ fn voice_file() -> PathBuf {
         candidates.push(cwd.join(VOICE_REL));
     }
     if let Ok(exe) = std::env::current_exe() {
-        // target/release/silo-alert -> project root
         if let Some(root) = exe.ancestors().nth(3) {
             candidates.push(root.join(VOICE_REL));
         }
@@ -198,9 +250,10 @@ fn voice_file() -> PathBuf {
 }
 
 fn set_playback_level() {
-    // Absolute path: the desktop session starts the app with a bare PATH.
+    let db = PCM_DB.load(Ordering::SeqCst);
+    let level = format!("{db}dB");
     let _ = Command::new("/usr/bin/amixer")
-        .args(["-c", "Headphones", "sset", "PCM", "--", PCM_LEVEL, "unmute"])
+        .args(["-c", "Headphones", "sset", "PCM", "--", &level, "unmute"])
         .output();
 }
 
@@ -217,8 +270,9 @@ pub fn play_voice() -> Result<(), String> {
         return Err("PTT did not go low".into());
     }
 
+    let device = audio_device();
     let mut child = Command::new("/usr/bin/aplay")
-        .args(["-D", AUDIO_DEVICE, "-q"])
+        .args(["-D", &device, "-q"])
         .arg(&wav)
         .spawn()
         .map_err(|e| format!("aplay: {e}"))?;

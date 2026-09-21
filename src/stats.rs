@@ -24,6 +24,19 @@ pub struct Stats {
     /// When the silo first looked empty, for the same reason.
     #[serde(default)]
     pub empty_since_unix: Option<u64>,
+    /// Monitoring stays off until the operator arms it.
+    #[serde(default)]
+    pub armed: bool,
+    #[serde(default)]
+    pub monitor_paused: bool,
+    #[serde(default)]
+    pub last_radio_ok: bool,
+    #[serde(default)]
+    pub last_radio_err: Option<String>,
+    #[serde(default)]
+    pub last_radio_unix: Option<u64>,
+    #[serde(default)]
+    pub wizard_done: bool,
 }
 
 impl Default for Stats {
@@ -42,6 +55,12 @@ impl Default for Stats {
             started_unix: now_unix(),
             empty_state: false,
             empty_since_unix: None,
+            armed: false,
+            monitor_paused: false,
+            last_radio_ok: true,
+            last_radio_err: None,
+            last_radio_unix: None,
+            wizard_done: false,
         }
     }
 }

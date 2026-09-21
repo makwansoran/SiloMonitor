@@ -1,6 +1,7 @@
 mod camera;
 mod config;
 mod eventlog;
+mod peltor;
 mod sa828;
 mod silo_alert;
 mod stats;
@@ -114,6 +115,13 @@ struct App {
     warned_no_reference: bool,
     /// Rolling on-disk copy of the terminal, for after-the-fact debugging.
     log_path: std::path::PathBuf,
+    /// Operator must arm after setup. Pause is separate and persisted.
+    armed: bool,
+    empty_streak: u32,
+    radio_fault: bool,
+    last_heartbeat: Option<Instant>,
+    evidence_tex: Option<egui::TextureHandle>,
+    evidence_path: Option<std::path::PathBuf>,
 }
 
 impl App {
@@ -123,14 +131,18 @@ impl App {
         let mut stats = Stats::load();
         let reference = Reference::load();
         stats.labels_empty = vision::list_references().len() as u64;
-        stats.labels_full = 0;
+        stats.labels_full = vision::list_full_samples().len() as u64;
         if reference.is_none() {
             stats.last_train_unix = None;
             stats.last_train_accuracy = None;
         }
         silo_alert::set_ptt_pin(cfg.radio.ptt_gpio);
+        silo_alert::set_audio_device(&cfg.radio.audio_device);
+        silo_alert::set_pcm_db(cfg.radio.pcm_db);
+        silo_alert::set_muted(cfg.radio.muted);
         let mut alert = SiloAlert::new();
-        alert.restore_last_alert_unix(stats.last_alert_unix);
+        // Already-empty after a reboot must not look like a fresh empty.
+        alert.restore(stats.empty_state, stats.last_alert_unix);
         let log_path = cfg.resolve_db_path().with_extension("jsonl");
         let text_log = cfg.resolve_db_path().with_extension("log");
         let mut empty_alerts = EventLog::load_empty_alerts(&log_path);
@@ -150,11 +162,23 @@ impl App {
         } else {
             eprintln!("supabase: disabled (set supabase.enabled + key, or SUPABASE_KEY)");
         }
-        let has_cam = cam.is_some();
-        // Carry the silo state across restarts so a power cycle does not
-        // restart the confirm window on an already-empty silo.
         let resume_empty = stats.empty_state;
         let resume_empty_since = stats.empty_since_unix;
+        let armed = stats.armed;
+        let monitor = !stats.monitor_paused;
+        let radio_fault = !stats.last_radio_ok && stats.last_radio_err.is_some();
+        if let Some(ref sb) = cloud {
+            sb.push_event("app_start", Some(resume_empty), None);
+        }
+        // Channel is source of truth; heal frequency from nearest Peltor ch.
+        let mut cfg = cfg;
+        if cfg.radio.channel == 0 || cfg.radio.channel > 16 {
+            cfg.radio.channel = peltor::channel_for_freq(&cfg.radio.frequency_mhz);
+        }
+        cfg.radio.channel = peltor::clamp_channel(cfg.radio.channel);
+        cfg.radio.frequency_mhz = peltor::sa828_freq_for_channel(cfg.radio.channel);
+        cfg.radio.ctcss = peltor::clamp_ctcss(cfg.radio.ctcss);
+        let radio_freq = cfg.radio.frequency_mhz.clone();
         Self {
             cam,
             live_tex: None,
@@ -163,7 +187,7 @@ impl App {
             last_match: None,
             alert: Some(alert),
             stats,
-            monitor: has_cam,
+            monitor,
             page: Page::Live,
             events: EventLog::open(log_path),
             empty_alerts,
@@ -177,7 +201,7 @@ impl App {
             dataset_dirty: false,
             thumb_tex: std::collections::HashMap::new(),
             logo_tex: None,
-            radio_freq: cfg.radio.frequency_mhz.clone(),
+            radio_freq,
             cloud,
             last_cloud_pull,
             cfg,
@@ -197,6 +221,12 @@ impl App {
             box_drag_now: None,
             warned_no_reference: false,
             log_path: text_log,
+            armed,
+            empty_streak: 0,
+            radio_fault,
+            last_heartbeat: None,
+            evidence_tex: None,
+            evidence_path: vision::latest_alert_evidence(),
         }
     }
 
@@ -227,6 +257,19 @@ impl App {
             Some((w, h, rgb)) => {
                 if self.cam_down_since.is_some() {
                     self.term_line(Self::term_now("camera  reconnected"));
+                    if let Some(cloud) = &self.cloud {
+                        cloud.push_event("camera_up", None, None);
+                    }
+                    // Do not restore EMPTY — confirm again from a live stream.
+                    self.empty = false;
+                    self.empty_since = None;
+                    self.empty_streak = 0;
+                    self.stats.empty_state = false;
+                    self.stats.empty_since_unix = None;
+                    self.stats.save();
+                    if let Some(alert) = &mut self.alert {
+                        alert.update(false);
+                    }
                 }
                 self.last_frame_at = Some(Instant::now());
                 self.cam_down_since = None;
@@ -288,7 +331,19 @@ impl App {
             self.last_rgb = None;
             self.last_match = None;
             self.empty_since = None;
+            self.empty_streak = 0;
+            // A dead camera must never look like a healthy silo.
+            self.empty = false;
+            self.stats.empty_state = false;
+            self.stats.empty_since_unix = None;
+            self.stats.save();
+            if let Some(alert) = &mut self.alert {
+                alert.update(false);
+            }
             self.term_line(Self::term_now("camera  no signal — reconnecting"));
+            if let Some(cloud) = &self.cloud {
+                cloud.push_event("camera_down", None, None);
+            }
         }
 
         let retry_due = self
@@ -424,7 +479,7 @@ impl App {
             ui,
             "Empty must last",
             &mut self.cfg.level.empty_confirmation_seconds,
-            0.0..=120.0,
+            15.0..=120.0,
             "s",
         );
 
@@ -502,33 +557,15 @@ impl App {
         }
     }
 
-    /// Frame source. On site this is the Ethernet camera over RTSP.
+    /// Ethernet camera over RTSP.
     fn config_camera(&mut self, ui: &mut egui::Ui) {
-        let rtsp = self.cfg.camera.is_rtsp();
-        ui.horizontal(|ui| {
-            ui.spacing_mut().item_spacing.x = 6.0;
-            if filter_chip(ui, "Ethernet", rtsp).clicked() {
-                self.cfg.camera.source = "rtsp".into();
-            }
-            if filter_chip(ui, "USB", !rtsp).clicked() {
-                self.cfg.camera.source = "usb".into();
-            }
-        });
-        ui.add_space(12.0);
-
-        if rtsp {
-            ui.label(RichText::new("RTSP URL").size(12.0).color(MUTED));
-            ui.add(
-                egui::TextEdit::singleline(&mut self.cfg.camera.rtsp_url)
-                    .desired_width(ui.available_width())
-                    .hint_text("rtsp://user:pass@192.168.1.50:554/stream1"),
-            );
-        } else {
-            let mut dev = self.cfg.camera.device as f32;
-            ui.label(RichText::new("USB device index").size(12.0).color(MUTED));
-            ui.add(egui::Slider::new(&mut dev, 0.0..=8.0).integer());
-            self.cfg.camera.device = dev as u32;
-        }
+        self.cfg.camera.source = "rtsp".into();
+        ui.label(RichText::new("RTSP URL").size(12.0).color(MUTED));
+        ui.add(
+            egui::TextEdit::singleline(&mut self.cfg.camera.rtsp_url)
+                .desired_width(ui.available_width())
+                .hint_text("rtsp://user:pass@192.168.1.50:554/stream1"),
+        );
 
         ui.add_space(10.0);
         ui.label(RichText::new("Resolution").size(12.0).color(MUTED));
@@ -567,33 +604,47 @@ impl App {
             "Connecting…"
         };
         row_stat(ui, "Camera", status);
-        row_stat(
-            ui,
-            "Source",
-            if rtsp { "Ethernet (RTSP)" } else { "USB" },
-        );
+        row_stat(ui, "Source", "Ethernet (RTSP)");
 
         ui.add_space(12.0);
         if pill(ui, "Reconnect camera").clicked() {
             self.reconnect_camera();
         }
-        ui.add_space(6.0);
-        ui.label(
-            RichText::new("Save first — reconnect uses the saved settings.")
-                .size(11.0)
-                .color(MUTED),
-        );
     }
 
-    /// SA828 intercom settings. Pi-only hardware; harmless on a laptop.
+    /// SA828 intercom settings matched to the Peltor LiteCom Pro III headset.
     fn config_radio(&mut self, ui: &mut egui::Ui) {
-        ui.label(RichText::new("Frequency (MHz)").size(12.0).color(MUTED));
-        ui.add(
-            egui::TextEdit::singleline(&mut self.radio_freq)
-                .desired_width(ui.available_width())
-                .hint_text("446.0062"),
+        ui.label(
+            RichText::new("Peltor LiteCom Pro III — analog PMR446")
+                .size(12.0)
+                .color(MUTED),
         );
         ui.add_space(10.0);
+
+        // Sync channel from stored frequency if needed.
+        self.cfg.radio.channel = peltor::clamp_channel(self.cfg.radio.channel);
+        if self.cfg.radio.channel == 0 {
+            self.cfg.radio.channel = peltor::channel_for_freq(&self.cfg.radio.frequency_mhz);
+        }
+
+        ui.label(RichText::new("Channel").size(12.0).color(MUTED));
+        let mut ch = self.cfg.radio.channel;
+        egui::ComboBox::from_id_salt("peltor_channel")
+            .width(ui.available_width())
+            .selected_text(peltor::channel_label(ch))
+            .show_ui(ui, |ui| {
+                for &(c, _) in &peltor::ANALOG_CHANNELS {
+                    ui.selectable_value(&mut ch, c, peltor::channel_label(c));
+                }
+            });
+        if ch != self.cfg.radio.channel {
+            self.cfg.radio.channel = ch;
+            self.apply_peltor_channel();
+        }
+        ui.add_space(4.0);
+        row_stat(ui, "SA828 freq", &self.cfg.radio.frequency_mhz);
+        ui.add_space(10.0);
+
         {
             let mut sq = self.cfg.radio.squelch as f32;
             ui.label(RichText::new("Squelch").size(12.0).color(MUTED));
@@ -604,6 +655,29 @@ impl App {
             );
             self.cfg.radio.squelch = sq as u8;
         }
+        ui.add_space(10.0);
+
+        self.cfg.radio.ctcss = peltor::clamp_ctcss(self.cfg.radio.ctcss);
+        ui.label(RichText::new("CTCSS").size(12.0).color(MUTED));
+        egui::ComboBox::from_id_salt("peltor_ctcss")
+            .width(ui.available_width())
+            .selected_text(peltor::ctcss_label(self.cfg.radio.ctcss))
+            .show_ui(ui, |ui| {
+                ui.selectable_value(&mut self.cfg.radio.ctcss, 0, "Off");
+                for &(idx, _) in &peltor::CTCSS_TONES {
+                    let label = peltor::ctcss_label(idx);
+                    ui.selectable_value(&mut self.cfg.radio.ctcss, idx, label);
+                }
+            });
+        ui.add_space(6.0);
+        ui.label(
+            RichText::new(
+                "Digital DMR channels on the headset are not used — SA828 is analog only.",
+            )
+            .size(11.0)
+            .color(MUTED),
+        );
+
         ui.add_space(10.0);
         ui.label(RichText::new("UART port").size(12.0).color(MUTED));
         ui.add(
@@ -621,6 +695,38 @@ impl App {
                     .suffix("  (0 = off)"),
             );
             self.cfg.radio.ptt_gpio = ptt as u8;
+        }
+        ui.add_space(10.0);
+        ui.label(RichText::new("Audio device").size(12.0).color(MUTED));
+        ui.add(
+            egui::TextEdit::singleline(&mut self.cfg.radio.audio_device)
+                .desired_width(ui.available_width())
+                .hint_text("plughw:CARD=Headphones,DEV=0"),
+        );
+        ui.add_space(10.0);
+        {
+            let mut db = self.cfg.radio.pcm_db as f32;
+            ui.label(RichText::new("TX volume").size(12.0).color(MUTED));
+            if ui
+                .add(egui::Slider::new(&mut db, -40.0..=0.0).integer().suffix(" dB"))
+                .changed()
+            {
+                self.cfg.radio.pcm_db = db as i8;
+                silo_alert::set_pcm_db(self.cfg.radio.pcm_db);
+            }
+            ui.add_space(4.0);
+            ui.label(
+                RichText::new("Into the SA828 mic. Above about −20 dB often becomes hiss.")
+                    .size(11.0)
+                    .color(MUTED),
+            );
+        }
+        ui.add_space(10.0);
+        if ui
+            .checkbox(&mut self.cfg.radio.muted, "Mute radio")
+            .changed()
+        {
+            silo_alert::set_muted(self.cfg.radio.muted);
         }
 
         ui.add_space(14.0);
@@ -647,6 +753,14 @@ impl App {
         if pill(ui, "Test radio").clicked() {
             self.test_radio();
         }
+    }
+
+    fn apply_peltor_channel(&mut self) {
+        let ch = peltor::clamp_channel(self.cfg.radio.channel);
+        self.cfg.radio.channel = ch;
+        let freq = peltor::sa828_freq_for_channel(ch);
+        self.cfg.radio.frequency_mhz = freq.clone();
+        self.radio_freq = freq;
     }
 
     /// Site identity, cloud sync and storage.
@@ -694,7 +808,7 @@ impl App {
         row_stat(
             ui,
             "State",
-            if self.empty { "Empty" } else { "OK" },
+            self.plant_state().label(),
         );
 
         ui.add_space(16.0);
@@ -705,13 +819,7 @@ impl App {
         ui.add_space(10.0);
         let monitoring = if self.monitor { "Pause monitoring" } else { "Resume monitoring" };
         if pill(ui, monitoring).clicked() {
-            self.monitor = !self.monitor;
-            let msg = if self.monitor {
-                "monitoring resumed"
-            } else {
-                "monitoring paused"
-            };
-            self.term_line(Self::term_now(msg));
+            self.set_paused(self.monitor);
         }
     }
 
@@ -728,11 +836,17 @@ impl App {
         ui.add_space(16.0);
         ui.label(RichText::new("Right now").size(12.0).color(MUTED));
         ui.add_space(8.0);
-        row_stat(ui, "State", if self.empty { "Empty" } else { "OK" });
+        row_stat(ui, "State", self.plant_state().label());
         row_stat(
             ui,
             "Monitoring",
-            if self.monitor { "Running" } else { "Paused" },
+            if !self.armed {
+                "Disarmed"
+            } else if self.monitor {
+                "Running"
+            } else {
+                "Paused"
+            },
         );
         row_stat(
             ui,
@@ -782,28 +896,31 @@ impl App {
         row_stat(ui, "Running since", &fmt_dt(self.stats.started_unix));
 
         ui.add_space(16.0);
-        ui.label(RichText::new("Model").size(12.0).color(MUTED));
+        ui.label(RichText::new("Reference").size(12.0).color(MUTED));
         ui.add_space(8.0);
+        row_stat(ui, "Empty photos", &self.stats.labels_empty.to_string());
+        row_stat(ui, "Full samples", &self.stats.labels_full.to_string());
         row_stat(
             ui,
-            "Accuracy (held-out)",
+            "Photos agree",
             &self
-                .stats
-                .last_train_accuracy
-                .map(|a| format!("{:.0}%", a * 100.0))
-                .unwrap_or_else(|| "Not trained".into()),
+                .reference
+                .as_ref()
+                .map(|r| format!("{:.0}%", r.cohesion * 100.0))
+                .unwrap_or_else(|| "—".into()),
         );
-        row_stat(ui, "Empty labels", &self.stats.labels_empty.to_string());
-        row_stat(ui, "Full labels", &self.stats.labels_full.to_string());
         row_stat(
             ui,
-            "Trained",
+            "Built",
             &self
                 .stats
                 .last_train_unix
                 .map(fmt_dt)
                 .unwrap_or_else(|| "Never".into()),
         );
+        if let Some(risk) = self.false_empty_risk() {
+            row_stat(ui, "False-empty risk", &risk);
+        }
 
         ui.add_space(16.0);
         ui.label(RichText::new("Cloud").size(12.0).color(MUTED));
@@ -864,7 +981,7 @@ impl App {
                                 .color(TEXT),
                         );
                         ui.add_space(8.0);
-                        line_chart(ui, &days);
+                        line_chart(ui, &days, 86400);
 
                         ui.add_space(24.0);
                         ui.label(
@@ -873,7 +990,7 @@ impl App {
                                 .color(TEXT),
                         );
                         ui.add_space(8.0);
-                        line_chart(ui, &hours);
+                        line_chart(ui, &hours, 3600);
 
                         ui.add_space(24.0);
                         ui.label(RichText::new("Recent alerts").size(13.0).color(TEXT));
@@ -957,7 +1074,7 @@ impl App {
         // weighing the plain picture and its black-and-white twin equally.
         let roi = reference.roi;
         let feat = vision::features_in_roi(w, h, rgb, roi);
-        let feat_bw = vision::bw_features(w, h, rgb, roi);
+        let feat_bw = vision::bw_features(w, h, rgb, roi, Some(reference.bw_threshold));
         let score = reference.similarity_pair(&feat, &feat_bw);
         self.last_match = Some(score);
 
@@ -965,25 +1082,30 @@ impl App {
         let looks_empty = score >= threshold;
 
         let unix = eventlog::now_unix();
-        let need = self.cfg.level.empty_confirmation_seconds.max(0.0) as u64;
+        let interval = self.cfg.level.check_interval_seconds.max(1.0);
+        let need = self.cfg.level.empty_confirmation_seconds.max(15.0) as u64;
+        let need_streak = ((need as f32 / interval).ceil() as u32).max(2);
         let pct = (score * 100.0).round();
         let ts = Local::now().format("%H:%M:%S");
 
         if looks_empty {
+            self.empty_streak = self.empty_streak.saturating_add(1);
             if self.empty_since.is_none() {
                 self.empty_since = Some(unix);
             }
         } else {
+            self.empty_streak = 0;
             self.empty_since = None;
         }
 
-        let confirmed = self
+        let long_enough = self
             .empty_since
             .map(|t| unix.saturating_sub(t) >= need)
             .unwrap_or(false);
+        let confirmed = looks_empty && long_enough && self.empty_streak >= need_streak;
 
-        let just_confirmed = confirmed && !self.empty;
-        let just_filled = !looks_empty && self.empty;
+        let just_confirmed = self.armed && confirmed && !self.empty;
+        let just_filled = self.armed && !looks_empty && self.empty;
 
         if just_confirmed {
             self.empty = true;
@@ -993,20 +1115,25 @@ impl App {
             if let Some(cloud) = &self.cloud {
                 cloud.push_empty_alert(unix);
             }
+            if let Ok(path) =
+                vision::save_alert_evidence(w, h, rgb, roi, unix, score, threshold, self.empty_streak)
+            {
+                self.evidence_path = Some(path);
+                self.evidence_tex = None;
+            }
         } else if just_filled {
             self.empty = false;
             self.events.state(unix, "level_state", "EMPTY", "OK", "");
         }
 
         let mut alerted = false;
-        if let Some(alert) = &mut self.alert {
-            if alert.update(self.empty) {
-                alerted = true;
-                self.stats.alerts_sent += 1;
-                self.stats.last_alert_unix = alert.last_alert_unix();
-                self.stats.save();
-                if let Some(cloud) = &self.cloud {
-                    cloud.push_stats(&self.stats);
+        if self.armed {
+            if let Some(alert) = &mut self.alert {
+                if alert.update(self.empty) {
+                    alerted = true;
+                    self.stats.alerts_sent += 1;
+                    self.stats.last_alert_unix = alert.last_alert_unix();
+                    self.stats.save();
                 }
             }
         }
@@ -1049,10 +1176,6 @@ impl App {
         self.stats.empty_since_unix = self.empty_since;
         if just_confirmed || just_filled {
             self.stats.save();
-        }
-        if let Some(cloud) = &self.cloud {
-            cloud.push_check(looks_empty, score);
-            cloud.push_stats(&self.stats);
         }
         if self.stats.checks % 4 == 0 || just_confirmed || just_filled {
             self.stats.save();
@@ -1136,6 +1259,9 @@ impl App {
         } else {
             labels.push(("Mark", false));
         }
+        if self.region.is_some() && !self.marking_region {
+            labels.push(("Clear", false));
+        }
         labels.push(("B&W", self.show_model_view));
 
         // Lay out right to left so the row hugs the corner.
@@ -1185,6 +1311,7 @@ impl App {
                     self.box_drag_now = None;
                 }
                 "B&W" => self.show_model_view = !self.show_model_view,
+                "Clear" => self.clear_region(),
                 _ => {}
             }
         }
@@ -1218,7 +1345,8 @@ impl App {
             return;
         };
         let roi = self.reference.as_ref().and_then(|r| r.roi).or(self.region);
-        let (mw, mh, pixels) = vision::bw_from_rgb(*w, *h, rgb, roi);
+        let threshold = self.reference.as_ref().map(|r| r.bw_threshold);
+        let (mw, mh, pixels) = vision::bw_from_rgb(*w, *h, rgb, roi, threshold);
         let img = egui::ColorImage::from_rgb([mw as usize, mh as usize], &pixels);
         match &mut self.model_tex {
             Some(t) => t.set(img, egui::TextureOptions::NEAREST),
@@ -1275,6 +1403,7 @@ impl App {
             Ok(r) => {
                 let n = r.count();
                 self.stats.labels_empty = n as u64;
+                self.stats.labels_full = vision::list_full_samples().len() as u64;
                 self.stats.last_train_unix = Some(r.built_at_unix);
                 self.stats.last_train_accuracy = Some(r.cohesion);
                 self.stats.save();
@@ -1298,13 +1427,14 @@ impl App {
     }
 
     fn program_sender(&mut self) {
+        self.apply_peltor_channel();
         match sa828::program(
-            &self.radio_freq,
+            &self.cfg.radio.frequency_mhz,
             self.cfg.radio.squelch,
+            self.cfg.radio.ctcss,
             &self.cfg.radio.uart_port,
         ) {
             Ok(msg) => {
-                self.cfg.radio.frequency_mhz = self.radio_freq.clone();
                 let _ = self.cfg.save();
                 self.note = msg;
             }
@@ -1320,10 +1450,177 @@ impl App {
     }
 
     fn save_config(&mut self) {
-        self.cfg.radio.frequency_mhz = self.radio_freq.clone();
+        self.apply_peltor_channel();
+        self.cfg.radio.ctcss = peltor::clamp_ctcss(self.cfg.radio.ctcss);
+        silo_alert::set_ptt_pin(self.cfg.radio.ptt_gpio);
+        silo_alert::set_audio_device(&self.cfg.radio.audio_device);
+        silo_alert::set_pcm_db(self.cfg.radio.pcm_db);
+        silo_alert::set_muted(self.cfg.radio.muted);
         match self.cfg.save() {
             Ok(()) => self.note = "Saved".into(),
             Err(e) => self.note = e,
+        }
+    }
+
+    fn add_full_photo(&mut self) {
+        let Some((w, h, rgb)) = self.last_rgb.clone() else {
+            self.note = "No frame yet".into();
+            return;
+        };
+        match vision::save_full_photo(w, h, &rgb) {
+            Ok(_) => {
+                self.stats.labels_full = vision::list_full_samples().len() as u64;
+                self.stats.save();
+                self.note = "Full sample saved".into();
+                self.term_line(Self::term_now("full sample saved"));
+            }
+            Err(e) => self.note = format!("Capture failed: {e}"),
+        }
+    }
+
+    fn set_armed(&mut self, armed: bool) {
+        self.armed = armed;
+        self.stats.armed = armed;
+        if armed {
+            self.stats.wizard_done = true;
+            self.stats.monitor_paused = false;
+            self.monitor = true;
+            self.term_line(Self::term_now("monitoring armed"));
+            if let Some(cloud) = &self.cloud {
+                cloud.push_event("armed", Some(self.empty), None);
+            }
+        } else {
+            self.term_line(Self::term_now("monitoring disarmed"));
+            if let Some(alert) = &mut self.alert {
+                alert.update(false);
+            }
+            if let Some(cloud) = &self.cloud {
+                cloud.push_event("disarmed", Some(self.empty), None);
+            }
+        }
+        self.stats.save();
+    }
+
+    fn set_paused(&mut self, paused: bool) {
+        self.monitor = !paused;
+        self.stats.monitor_paused = paused;
+        self.stats.save();
+        if paused {
+            self.term_line(Self::term_now("monitoring paused"));
+        } else {
+            self.term_line(Self::term_now("monitoring resumed"));
+        }
+    }
+
+    fn can_arm(&self) -> bool {
+        self.region.is_some() && self.reference.as_ref().map(|r| r.count() >= 1).unwrap_or(false)
+    }
+
+    fn wizard_step(&self) -> Option<&'static str> {
+        if self.armed || self.stats.wizard_done {
+            return None;
+        }
+        if self.region.is_none() {
+            return Some("1  Mark the region");
+        }
+        if self.samples.len() < 3 {
+            return Some("2  Take 3 empty photos");
+        }
+        if vision::list_full_samples().is_empty() {
+            return Some("3  Optional: take a full sample");
+        }
+        Some("4  Arm when the dry-run looks right")
+    }
+
+    fn dry_run_line(&self) -> Option<String> {
+        let score = self.last_match?;
+        let th = self.match_threshold();
+        if score >= th {
+            Some(format!("would alert  ({:.0}% ≥ {:.0}%)", score * 100.0, th * 100.0))
+        } else {
+            Some(format!("would not  ({:.0}% < {:.0}%)", score * 100.0, th * 100.0))
+        }
+    }
+
+    fn false_empty_risk(&self) -> Option<String> {
+        let r = self.reference.as_ref()?;
+        let risk = vision::false_empty_risk(r, self.match_threshold())?;
+        Some(if risk < 0.34 {
+            "Low".into()
+        } else if risk < 0.67 {
+            "Medium".into()
+        } else {
+            "High".into()
+        })
+    }
+
+    fn ensure_evidence(&mut self, ctx: &egui::Context) {
+        if self.evidence_tex.is_some() {
+            return;
+        }
+        let Some(path) = self.evidence_path.as_ref() else {
+            return;
+        };
+        if let Ok((w, h, rgba)) = vision::load_thumb_rgba(path, 240) {
+            let img = egui::ColorImage::from_rgba_unmultiplied([w as usize, h as usize], &rgba);
+            self.evidence_tex = Some(ctx.load_texture("evidence", img, Default::default()));
+        }
+    }
+
+    fn plant_state(&self) -> PlantState {
+        let cam_dead = self.cam_down_since.is_some()
+            || (self.last_frame_at.is_none() && self.started_at.elapsed() >= CAM_GRACE);
+        if cam_dead {
+            return PlantState::CameraFault;
+        }
+        if self.radio_fault && !self.cfg.radio.muted {
+            return PlantState::RadioFault;
+        }
+        if !self.armed {
+            return PlantState::Disarmed;
+        }
+        if !self.monitor {
+            return PlantState::Paused;
+        }
+        if self.empty {
+            PlantState::Empty
+        } else {
+            PlantState::Ok
+        }
+    }
+
+    fn tick_heartbeat(&mut self) {
+        let due = self
+            .last_heartbeat
+            .map(|t| t.elapsed() >= Duration::from_secs(300))
+            .unwrap_or(true);
+        if !due {
+            return;
+        }
+        self.last_heartbeat = Some(Instant::now());
+        if let Some(cloud) = &self.cloud {
+            cloud.push_heartbeat(&self.stats);
+        }
+    }
+
+    fn take_radio_status(&mut self) {
+        let Some(msg) = silo_alert::take_status() else {
+            return;
+        };
+        let ok = silo_alert::status_ok(&msg);
+        self.radio_fault = !ok;
+        self.stats.last_radio_ok = ok;
+        self.stats.last_radio_unix = Some(eventlog::now_unix());
+        self.stats.last_radio_err = if ok { None } else { Some(msg.clone()) };
+        self.stats.save();
+        self.term_line(Self::term_now(&format!("radio  {msg}")));
+        self.note = msg.clone();
+        if let Some(cloud) = &self.cloud {
+            if ok {
+                cloud.push_event("radio_tx", Some(self.empty), None);
+            } else {
+                cloud.push_event("radio_fail", Some(self.empty), None);
+            }
         }
     }
 
@@ -1345,6 +1642,7 @@ impl App {
             self.sample_view = None;
         }
         self.stats.labels_empty = self.samples.len() as u64;
+        self.stats.labels_full = vision::list_full_samples().len() as u64;
     }
 
     fn load_sample_preview(&mut self, idx: usize) {
@@ -1607,8 +1905,12 @@ impl App {
                         self.region = Some(b);
                         vision::save_region(self.region);
                         self.marking_region = false;
-                        self.note = "Region marked — rebuild the reference".into();
                         self.term_line(Self::term_now("region marked"));
+                        if !self.samples.is_empty() {
+                            self.rebuild_reference();
+                        } else {
+                            self.note = "Region marked".into();
+                        }
                     }
                     None => self.note = "Region too small".into(),
                 }
@@ -1659,7 +1961,11 @@ impl App {
     fn clear_region(&mut self) {
         self.region = None;
         vision::save_region(None);
-        self.note = "Region cleared — rebuild the reference".into();
+        if !self.samples.is_empty() {
+            self.rebuild_reference();
+        } else {
+            self.note = "Region cleared".into();
+        }
     }
 
     /// True when the marked region no longer matches the reference's.
@@ -1669,27 +1975,54 @@ impl App {
             None => false,
         }
     }
+}
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PlantState {
+    CameraFault,
+    RadioFault,
+    Disarmed,
+    Paused,
+    Empty,
+    Ok,
+}
+
+impl PlantState {
+    fn label(self) -> &'static str {
+        match self {
+            PlantState::CameraFault => "CAMERA FAULT",
+            PlantState::RadioFault => "RADIO FAULT",
+            PlantState::Disarmed => "DISARMED",
+            PlantState::Paused => "PAUSED",
+            PlantState::Empty => "EMPTY",
+            PlantState::Ok => "OK",
+        }
+    }
+
+    fn color(self) -> Color32 {
+        match self {
+            PlantState::CameraFault | PlantState::RadioFault | PlantState::Empty => RED,
+            PlantState::Disarmed | PlantState::Paused => MUTED,
+            PlantState::Ok => TEXT,
+        }
+    }
 }
 
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         style(ctx);
         self.ensure_logo(ctx);
-        // Radio outcomes must be visible to the operator, not just on stderr.
-        if let Some(msg) = silo_alert::take_status() {
-            self.term_line(Self::term_now(&format!("radio  {msg}")));
-            self.note = msg;
-        }
+        self.take_radio_status();
         if self.dataset_dirty {
             self.refresh_samples();
         }
         self.pull_frame(ctx);
         self.sync_model_view(ctx);
+        self.tick_heartbeat();
         if self.page == Page::Model && self.sample_idx.is_some() {
             self.sync_sample_tex(ctx);
         }
-        ctx.request_repaint();
+        ctx.request_repaint_after(Duration::from_millis(100));
 
         let has_reference = self.reference.is_some();
 
@@ -1745,27 +2078,41 @@ impl eframe::App for App {
                             .last_check_at
                             .map(|t| (interval - t.elapsed().as_secs_f32()).max(0.0).ceil() as u32)
                             .unwrap_or(0);
+                        let state = self.plant_state();
 
                         ui.label(RichText::new("Live").size(22.0).color(TEXT).strong());
                         ui.add_space(6.0);
-                        if has_reference {
-                            let (label, color) = if self.empty {
-                                ("Empty", RED)
-                            } else {
-                                ("Full", TEXT)
-                            };
-                            ui.label(RichText::new(label).size(28.0).color(color).strong());
-                            ui.add_space(2.0);
-                            ui.label(
-                                RichText::new(
-                                    self.last_match
-                                        .map(|m| format!("{:.0}% match", m * 100.0))
-                                        .unwrap_or_else(|| "—".into()),
-                                )
-                                .size(14.0)
-                                .color(MUTED),
-                            );
+                        ui.label(
+                            RichText::new(state.label())
+                                .size(28.0)
+                                .color(state.color())
+                                .strong(),
+                        );
+                        if self.cfg.radio.muted {
+                            ui.add_space(4.0);
+                            ui.label(RichText::new("MUTE").size(13.0).color(RED).strong());
+                        }
+                        ui.add_space(2.0);
+                        ui.label(
+                            RichText::new(
+                                self.last_match
+                                    .map(|m| format!("{:.0}% match", m * 100.0))
+                                    .unwrap_or_else(|| "—".into()),
+                            )
+                            .size(14.0)
+                            .color(MUTED),
+                        );
 
+                        if let Some(step) = self.wizard_step() {
+                            ui.add_space(10.0);
+                            ui.label(RichText::new(step).size(13.0).color(BLUE));
+                            if let Some(dry) = self.dry_run_line() {
+                                ui.add_space(4.0);
+                                ui.label(RichText::new(dry).size(12.0).color(MUTED));
+                            }
+                        }
+
+                        if has_reference {
                             ui.add_space(12.0);
                             match self.confidence() {
                                 Some(c) => {
@@ -1811,21 +2158,82 @@ impl eframe::App for App {
                             );
                         }
 
-                        ui.add_space(18.0);
+                        ui.add_space(12.0);
+                        row_stat(
+                            ui,
+                            "Last TX",
+                            &self
+                                .stats
+                                .last_radio_unix
+                                .map(fmt_dt)
+                                .unwrap_or_else(|| "Never".into()),
+                        );
+                        row_stat(
+                            ui,
+                            "Radio",
+                            if self.radio_fault {
+                                "Fault"
+                            } else if self.cfg.radio.muted {
+                                "Muted"
+                            } else if self
+                                .stats
+                                .last_radio_ok
+                            {
+                                "OK"
+                            } else {
+                                "—"
+                            },
+                        );
+                        if self.empty && self.armed {
+                            if let Some(left) =
+                                self.alert.as_ref().and_then(|a| a.next_repeat_in())
+                            {
+                                row_stat(ui, "Re-announce", &format!("{left}s"));
+                            }
+                        }
+
+                        self.ensure_evidence(ui.ctx());
+                        if let Some(tex) = self.evidence_tex.as_ref() {
+                            ui.add_space(8.0);
+                            ui.label(RichText::new("Last alert").size(12.0).color(MUTED));
+                            ui.add_space(4.0);
+                            let size = tex.size_vec2();
+                            let w = ui.available_width().min(200.0);
+                            let scale = w / size.x.max(1.0);
+                            ui.image((tex.id(), size * scale));
+                        }
+
+                        ui.add_space(14.0);
                         if pill_accent(ui, "Take reference").clicked() {
                             self.add_reference_photo();
+                        }
+                        if !self.empty {
+                            ui.add_space(8.0);
+                            if pill(ui, "Take full sample").clicked() {
+                                self.add_full_photo();
+                            }
                         }
 
                         ui.add_space(12.0);
                         note_line(ui, &self.note);
                         ui.add_space(8.0);
-                        let pause = if self.monitor { "Pause" } else { "Resume" };
-                        if pill(ui, pause).clicked() {
-                            self.monitor = !self.monitor;
-                            if self.monitor {
-                                self.term_line(Self::term_now("monitoring resumed"));
-                            } else {
-                                self.term_line(Self::term_now("monitoring paused"));
+                        if !self.armed {
+                            let can_arm = self.can_arm();
+                            if pill_accent(ui, "Arm").clicked() {
+                                if can_arm {
+                                    self.set_armed(true);
+                                } else {
+                                    self.note = "Mark a region and take empty photos first".into();
+                                }
+                            }
+                        } else {
+                            let pause = if self.monitor { "Pause" } else { "Resume" };
+                            if pill(ui, pause).clicked() {
+                                self.set_paused(self.monitor);
+                            }
+                            ui.add_space(8.0);
+                            if pill(ui, "Disarm").clicked() {
+                                self.set_armed(false);
                             }
                         }
                     }
@@ -1870,6 +2278,14 @@ impl eframe::App for App {
                                     "Alerts at",
                                     &format!("{:.0}% match", self.match_threshold() * 100.0),
                                 );
+                                row_stat(
+                                    ui,
+                                    "Full samples",
+                                    &vision::list_full_samples().len().to_string(),
+                                );
+                                if let Some(risk) = self.false_empty_risk() {
+                                    row_stat(ui, "False-empty risk", &risk);
+                                }
 
                                 if self.region_changed() {
                                     ui.add_space(8.0);
@@ -2300,7 +2716,7 @@ fn fmt_dt(unix: u64) -> String {
     }
 }
 
-fn line_chart(ui: &mut egui::Ui, values: &[u32]) {
+fn line_chart(ui: &mut egui::Ui, values: &[u32], bucket_secs: u64) {
     let w = ui.available_width();
     let (rect, _) = ui.allocate_exact_size(Vec2::new(w, 148.0), Sense::hover());
     let painter = ui.painter_at(rect);
@@ -2338,14 +2754,25 @@ fn line_chart(ui: &mut egui::Ui, values: &[u32]) {
         painter.circle_filled(*p, 1.5, CARD);
     }
     let now = eventlog::now_unix();
-    let end = (now / 86400) * 86400;
+    let step = bucket_secs.max(1);
+    let end = (now / step) * step;
     for i in 0..n {
-        let t = end.saturating_sub((n as u64 - 1 - i as u64) * 86400);
+        let t = end.saturating_sub((n as u64 - 1 - i as u64) * step);
         let letter = match Local.timestamp_opt(t as i64, 0) {
-            chrono::LocalResult::Single(dt) => dt.format("%a").to_string(),
+            chrono::LocalResult::Single(dt) => {
+                if bucket_secs >= 86400 {
+                    dt.format("%a").to_string()
+                } else {
+                    dt.format("%H").to_string()
+                }
+            }
             _ => String::new(),
         };
-        let letter = letter.chars().next().unwrap_or(' ');
+        let letter = if bucket_secs >= 86400 {
+            letter.chars().next().unwrap_or(' ').to_string()
+        } else {
+            letter
+        };
         let x = if n == 1 {
             inner.center().x
         } else {
@@ -2396,6 +2823,8 @@ fn main() -> eframe::Result {
     let opts = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1180.0, 720.0])
+            .with_fullscreen(true)
+            .with_maximized(true)
             .with_title("Spectr Vision"),
         renderer: eframe::Renderer::Glow,
         ..Default::default()

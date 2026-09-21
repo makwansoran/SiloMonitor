@@ -1,8 +1,8 @@
 [Unit]
 Description=Spectr Vision — silo empty monitoring
-# The camera is USB and the desktop session owns the display, so wait for both.
-After=graphical.target dev-video0.device
-Wants=graphical.target
+# Ethernet camera + desktop session. Do not wait for USB video0.
+After=graphical.target network-online.target
+Wants=graphical.target network-online.target
 
 [Service]
 Type=simple

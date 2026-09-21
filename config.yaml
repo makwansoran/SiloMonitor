@@ -1,11 +1,10 @@
 camera:
-  # "rtsp" for the Ethernet camera on site, "usb" for bench work.
-  source: "usb"
+  # Ethernet camera on site. USB is not supported.
+  source: "rtsp"
   rtsp_url: ""
-  device: 0
   width: 640
   height: 480
-  # Decode rate. Low is fine — the model only looks each check interval.
+  # Decode rate. Low is fine — the match only looks each check interval.
   fps: 2
 
 level:
@@ -22,9 +21,16 @@ storage:
 
 radio:
   frequency_mhz: "446.0062"
+  # Peltor LiteCom Pro III analog PMR446 channel (1–16).
+  channel: 1
   squelch: 1
+  # CTCSS: 0 = Off, 1–38 = tone (must match the headset if it uses privacy).
+  ctcss: 0
   uart_port: "/dev/serial0"
   ptt_gpio: 17
+  audio_device: "plughw:CARD=Headphones,DEV=0"
+  # PCM into the SA828 mic. Louder than about −20dB often becomes hiss.
+  pcm_db: -28
 
 supabase:
   enabled: true
