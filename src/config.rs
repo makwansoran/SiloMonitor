@@ -143,7 +143,8 @@ impl Default for RadioCfg {
 }
 
 fn default_ptt_gpio() -> u8 {
-    17
+    // BCM 23 = header pin 16. Open-drain PTT into SA828.
+    23
 }
 
 fn default_freq() -> String {

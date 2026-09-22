@@ -1,7 +1,9 @@
 //! Empty-silo announcement over the SA828.
 //!
 //! Wiring this module assumes:
-//!   PTT (SA828 pin 20) -> Pi GPIO17, header pin 11. Low = transmit.
+//!   PTT (SA828 pin 20) -> Pi GPIO23, header pin 16.
+//!   Open-drain style: OUTPUT LOW sinks to key TX; INPUT (High-Z) for idle
+//!   so the Pi never drives 3.3 V into the module's pull-up.
 //!   Audio: Pi 3.5 mm jack -> series pot -> MIC+/MIC-.
 //!   Radio VCC from its own 5 V supply, grounds bonded to the Pi.
 
@@ -76,27 +78,34 @@ fn set_status(msg: String) {
     }
 }
 
-fn open_ptt() -> Result<Option<OutputPin>, String> {
+/// Idle = High-Z input. Never drive the pin high into the SA828 PTT pull-up.
+pub fn release_ptt() {
+    let pin = PTT_PIN.load(Ordering::SeqCst);
+    if pin == 0 {
+        return;
+    }
+    let Ok(gpio) = Gpio::new() else {
+        return;
+    };
+    let Ok(p) = gpio.get(pin) else {
+        return;
+    };
+    let _ = p.into_input();
+}
+
+/// Claim the pin as an open-drain sink (OUTPUT LOW) for the TX window.
+fn key_ptt_pin() -> Result<Option<OutputPin>, String> {
     let pin = PTT_PIN.load(Ordering::SeqCst);
     if pin == 0 {
         return Ok(None);
     }
     let mut out = Gpio::new()
         .and_then(|gpio| gpio.get(pin))
-        .map(|p| p.into_output_high())
+        .map(|p| p.into_output_low())
         .map_err(|e| format!("PTT GPIO{pin}: {e}"))?;
-    // Reset-on-drop restores whatever level the pin had before we claimed it.
-    // After an interrupted transmission that is low, which would re-key the
-    // radio the moment this handle drops, so release it explicitly instead.
+    // Drop must not restore a previous level — we go High-Z via release_ptt.
     out.set_reset_on_drop(false);
     Ok(Some(out))
-}
-
-/// Undo a transmission that was interrupted before PTT could be released.
-pub fn release_ptt() {
-    if let Ok(Some(mut out)) = open_ptt() {
-        out.set_high();
-    }
 }
 
 /// Keys the transmitter for as long as it is alive.
@@ -104,9 +113,8 @@ struct Ptt(Option<OutputPin>);
 
 impl Ptt {
     fn key() -> Result<Self, String> {
-        let mut out = open_ptt()?;
-        if let Some(p) = out.as_mut() {
-            p.set_low();
+        let out = key_ptt_pin()?;
+        if out.is_some() {
             thread::sleep(TX_LEAD_IN);
         }
         Ok(Self(out))
@@ -120,10 +128,10 @@ impl Ptt {
 
 impl Drop for Ptt {
     fn drop(&mut self) {
-        if let Some(out) = self.0.as_mut() {
-            thread::sleep(TX_TAIL);
-            out.set_high();
-        }
+        thread::sleep(TX_TAIL);
+        // Drop the output handle first, then float the pin.
+        drop(self.0.take());
+        release_ptt();
     }
 }
 

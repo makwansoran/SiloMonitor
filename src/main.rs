@@ -692,7 +692,7 @@ impl App {
             ui.add(
                 egui::Slider::new(&mut ptt, 0.0..=27.0)
                     .integer()
-                    .suffix("  (0 = off)"),
+                    .suffix("  (0=off, open-drain)"),
             );
             self.cfg.radio.ptt_gpio = ptt as u8;
         }
