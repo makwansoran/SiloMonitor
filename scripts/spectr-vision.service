@@ -17,6 +17,8 @@ Environment=WINIT_UNIX_BACKEND=x11
 ExecStartPre=-/usr/bin/xset -display :0 s off
 ExecStartPre=-/usr/bin/xset -display :0 s noblank
 ExecStartPre=-/usr/bin/xset -display :0 -dpms
+# Force PTT High-Z (input, no pull) on GPIO23 only — never touch GPIO17.
+ExecStartPre=-/usr/bin/pinctrl set 23 ip
 
 ExecStart=/home/spectr/silo-alert/target/release/silo-alert
 

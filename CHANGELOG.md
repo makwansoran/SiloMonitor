@@ -5,9 +5,9 @@ Every change in this pass. Same product: empty-reference match → confirm → S
 ## Radio
 
 - **peltor-channels** — `src/peltor.rs`, Config Radio, `src/sa828.rs`, `config.yaml`, `tools/program_sa828.py`. Channel picker for Peltor LiteCom Pro III analog PMR446 Ch 1–16. CTCSS Off + 38 tones (default Off). Program writes matching TX/RX tone to SA828. Digital DMR channels are not used (analog module only).
-- **tx-volume** — Config Radio slider for PCM dB into the SA828 mic (default −28). Was a hardcoded constant.
-- **ptt-open-drain** — `src/silo_alert.rs`. PTT idle is GPIO INPUT (High-Z), TX is OUTPUT LOW. Never drive 3.3 V into SA828. Default pin GPIO23 (header 16).
-- **ptt-once** — Radio TX only when the silo *becomes* empty (PTT + WAV once). No 90s re-announce while still empty. Config → Test radio still works when disarmed.
+- **tx-volume** — Removed. App no longer calls amixer/sox gain. Operator sets Pi system volume only; Test radio / alerts play the WAV as-is.
+- **ptt-once** — Radio TX only on the empty-*confirmed* edge (PTT + WAV once). Sticky latch until vision sees full again. Test radio: PTT LOW → WAV once → High-Z.
+- **ptt-open-drain** — `src/silo_alert.rs`. True open-drain on **GPIO23 only**: TX = OUTPUT LOW, idle = INPUT High-Z. Never touch GPIO17. Never OUTPUT HIGH / pull-up.
 
 ## P0
 

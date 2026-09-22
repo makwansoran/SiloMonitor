@@ -118,9 +118,6 @@ pub struct RadioCfg {
     pub ptt_gpio: u8,
     #[serde(default = "default_audio_device")]
     pub audio_device: String,
-    /// PCM playback into the SA828 mic, dB. Default −28 keeps the mic clean.
-    #[serde(default = "default_pcm_db")]
-    pub pcm_db: i8,
     /// Laptop (no GPIO) defaults muted so a bench run never keys a radio.
     #[serde(default = "default_muted")]
     pub muted: bool,
@@ -136,14 +133,13 @@ impl Default for RadioCfg {
             uart_port: default_uart_port(),
             ptt_gpio: default_ptt_gpio(),
             audio_device: default_audio_device(),
-            pcm_db: default_pcm_db(),
             muted: default_muted(),
         }
     }
 }
 
 fn default_ptt_gpio() -> u8 {
-    // BCM 23 = header pin 16. Open-drain PTT into SA828.
+    // BCM 23 = header pin 16. Open-drain: LOW = TX, High-Z idle (no 3.3 V).
     23
 }
 
@@ -165,10 +161,6 @@ fn default_uart_port() -> String {
 
 fn default_audio_device() -> String {
     "plughw:CARD=Headphones,DEV=0".into()
-}
-
-fn default_pcm_db() -> i8 {
-    -28
 }
 
 fn default_muted() -> bool {

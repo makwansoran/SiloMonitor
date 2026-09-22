@@ -138,7 +138,6 @@ impl App {
         }
         silo_alert::set_ptt_pin(cfg.radio.ptt_gpio);
         silo_alert::set_audio_device(&cfg.radio.audio_device);
-        silo_alert::set_pcm_db(cfg.radio.pcm_db);
         silo_alert::set_muted(cfg.radio.muted);
         let mut alert = SiloAlert::new();
         // Already-empty after a reboot must not look like a fresh empty.
@@ -267,9 +266,7 @@ impl App {
                     self.stats.empty_state = false;
                     self.stats.empty_since_unix = None;
                     self.stats.save();
-                    if let Some(alert) = &mut self.alert {
-                        alert.update(false);
-                    }
+                    // Do not clear radio announce latch — RTSP flaps must not re-TX.
                 }
                 self.last_frame_at = Some(Instant::now());
                 self.cam_down_since = None;
@@ -337,9 +334,7 @@ impl App {
             self.stats.empty_state = false;
             self.stats.empty_since_unix = None;
             self.stats.save();
-            if let Some(alert) = &mut self.alert {
-                alert.update(false);
-            }
+            // Keep announce latch — a dead camera is not "silo filled".
             self.term_line(Self::term_now("camera  no signal — reconnecting"));
             if let Some(cloud) = &self.cloud {
                 cloud.push_event("camera_down", None, None);
@@ -692,7 +687,7 @@ impl App {
             ui.add(
                 egui::Slider::new(&mut ptt, 0.0..=27.0)
                     .integer()
-                    .suffix("  (0=off, open-drain)"),
+                    .suffix("  (0=off; LOW=TX, High-Z idle)"),
             );
             self.cfg.radio.ptt_gpio = ptt as u8;
         }
@@ -703,27 +698,12 @@ impl App {
                 .desired_width(ui.available_width())
                 .hint_text("plughw:CARD=Headphones,DEV=0"),
         );
-        ui.add_space(10.0);
-        {
-            let mut db = self.cfg.radio.pcm_db as f32;
-            ui.label(RichText::new("TX volume").size(12.0).color(MUTED));
-            if ui
-                .add(egui::Slider::new(&mut db, -40.0..=0.0).integer().suffix(" dB"))
-                .changed()
-            {
-                self.cfg.radio.pcm_db = db as i8;
-                silo_alert::set_pcm_db(self.cfg.radio.pcm_db);
-                let _ = self.cfg.save();
-            }
-            ui.add_space(4.0);
-            ui.label(
-                RichText::new(
-                    "Software gain into the SA828 mic (needs sox). Try −12…0 if too quiet.",
-                )
+        ui.add_space(4.0);
+        ui.label(
+            RichText::new("Volume is the Pi system volume — the app does not change it.")
                 .size(11.0)
                 .color(MUTED),
-            );
-        }
+        );
         ui.add_space(10.0);
         if ui
             .checkbox(&mut self.cfg.radio.muted, "Mute radio")
@@ -756,6 +736,12 @@ impl App {
         if pill(ui, "Test radio").clicked() {
             self.test_radio();
         }
+        ui.add_space(4.0);
+        ui.label(
+            RichText::new("Test radio: PTT LOW → play WAV once → High-Z idle.")
+                .size(11.0)
+                .color(MUTED),
+        );
     }
 
     fn apply_peltor_channel(&mut self) {
@@ -1110,6 +1096,7 @@ impl App {
         let just_confirmed = self.armed && confirmed && !self.empty;
         let just_filled = self.armed && !looks_empty && self.empty;
 
+        let mut alerted = false;
         if just_confirmed {
             self.empty = true;
             self.events.empty_alert(unix);
@@ -1124,20 +1111,20 @@ impl App {
                 self.evidence_path = Some(path);
                 self.evidence_tex = None;
             }
-        } else if just_filled {
-            self.empty = false;
-            self.events.state(unix, "level_state", "EMPTY", "OK", "");
-        }
-
-        let mut alerted = false;
-        if self.armed {
+            // TX only on this edge — never on every check while still empty.
             if let Some(alert) = &mut self.alert {
-                if alert.update(self.empty) {
+                if alert.on_empty_confirmed() {
                     alerted = true;
                     self.stats.alerts_sent += 1;
                     self.stats.last_alert_unix = alert.last_alert_unix();
                     self.stats.save();
                 }
+            }
+        } else if just_filled {
+            self.empty = false;
+            self.events.state(unix, "level_state", "EMPTY", "OK", "");
+            if let Some(alert) = &mut self.alert {
+                alert.on_filled();
             }
         }
 
@@ -1457,7 +1444,6 @@ impl App {
         self.cfg.radio.ctcss = peltor::clamp_ctcss(self.cfg.radio.ctcss);
         silo_alert::set_ptt_pin(self.cfg.radio.ptt_gpio);
         silo_alert::set_audio_device(&self.cfg.radio.audio_device);
-        silo_alert::set_pcm_db(self.cfg.radio.pcm_db);
         silo_alert::set_muted(self.cfg.radio.muted);
         match self.cfg.save() {
             Ok(()) => self.note = "Saved".into(),
@@ -1494,9 +1480,7 @@ impl App {
             }
         } else {
             self.term_line(Self::term_now("monitoring disarmed"));
-            if let Some(alert) = &mut self.alert {
-                alert.update(false);
-            }
+            // Do not clear announce latch — re-arm while still empty must not re-TX.
             if let Some(cloud) = &self.cloud {
                 cloud.push_event("disarmed", Some(self.empty), None);
             }
@@ -2791,10 +2775,14 @@ fn main() -> eframe::Result {
         unsafe { std::env::set_var("WINIT_UNIX_BACKEND", "x11") };
     }
 
-    // Headless check of the exact path the Test radio button uses.
-    if std::env::args().any(|a| a == "--test-radio") {
+    // Unkey PTT before anything else — power-up must not leave the radio keyed.
+    {
         let cfg = Config::load();
         silo_alert::set_ptt_pin(cfg.radio.ptt_gpio);
+    }
+
+    // Headless check of the exact path the Test radio button uses.
+    if std::env::args().any(|a| a == "--test-radio") {
         match silo_alert::play_voice() {
             Ok(()) => {
                 println!("Played silo is empty");

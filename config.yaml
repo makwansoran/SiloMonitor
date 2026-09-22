@@ -30,9 +30,7 @@ radio:
   # BCM 23 = header pin 16. Open-drain: LOW keys TX, High-Z when idle.
   ptt_gpio: 23
   audio_device: "plughw:CARD=Headphones,DEV=0"
-  # PCM into the SA828 mic. Louder than about −20dB often becomes hiss.
-  pcm_db: -28
-
+  # Volume: set on the Pi (alsamixer / desktop). The app does not change PCM.
 supabase:
   enabled: true
   url: "https://mranicltlsnjurjqwjpv.supabase.co"
