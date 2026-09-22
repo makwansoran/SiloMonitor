@@ -713,12 +713,15 @@ impl App {
             {
                 self.cfg.radio.pcm_db = db as i8;
                 silo_alert::set_pcm_db(self.cfg.radio.pcm_db);
+                let _ = self.cfg.save();
             }
             ui.add_space(4.0);
             ui.label(
-                RichText::new("Into the SA828 mic. Above about −20 dB often becomes hiss.")
-                    .size(11.0)
-                    .color(MUTED),
+                RichText::new(
+                    "Software gain into the SA828 mic (needs sox). Try −12…0 if too quiet.",
+                )
+                .size(11.0)
+                .color(MUTED),
             );
         }
         ui.add_space(10.0);
@@ -1153,7 +1156,7 @@ impl App {
         self.term_entry(
             format!(
                 "{ts}  check  {kind}  match {pct:.0}%{conf}{}",
-                if cooldown { "  (alert cooldown)" } else { "" }
+                if cooldown { "  (already alerted)" } else { "" }
             ),
             shot,
         );
@@ -2185,11 +2188,7 @@ impl eframe::App for App {
                             },
                         );
                         if self.empty && self.armed {
-                            if let Some(left) =
-                                self.alert.as_ref().and_then(|a| a.next_repeat_in())
-                            {
-                                row_stat(ui, "Re-announce", &format!("{left}s"));
-                            }
+                            row_stat(ui, "Alert", "Sent for this empty");
                         }
 
                         self.ensure_evidence(ui.ctx());
@@ -2217,6 +2216,11 @@ impl eframe::App for App {
                         ui.add_space(12.0);
                         note_line(ui, &self.note);
                         ui.add_space(8.0);
+                        let pause = if self.monitor { "Pause" } else { "Resume" };
+                        if pill(ui, pause).clicked() {
+                            self.set_paused(self.monitor);
+                        }
+                        ui.add_space(8.0);
                         if !self.armed {
                             let can_arm = self.can_arm();
                             if pill_accent(ui, "Arm").clicked() {
@@ -2226,15 +2230,8 @@ impl eframe::App for App {
                                     self.note = "Mark a region and take empty photos first".into();
                                 }
                             }
-                        } else {
-                            let pause = if self.monitor { "Pause" } else { "Resume" };
-                            if pill(ui, pause).clicked() {
-                                self.set_paused(self.monitor);
-                            }
-                            ui.add_space(8.0);
-                            if pill(ui, "Disarm").clicked() {
-                                self.set_armed(false);
-                            }
+                        } else if pill(ui, "Disarm").clicked() {
+                            self.set_armed(false);
                         }
                     }
                     Page::Model => {
@@ -2823,8 +2820,6 @@ fn main() -> eframe::Result {
     let opts = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1180.0, 720.0])
-            .with_fullscreen(true)
-            .with_maximized(true)
             .with_title("Spectr Vision"),
         renderer: eframe::Renderer::Glow,
         ..Default::default()

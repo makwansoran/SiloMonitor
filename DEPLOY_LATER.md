@@ -27,4 +27,10 @@ sudo systemctl enable --now spectr-vision.service
 Confirm log: `supabase: enabled site=spectr-pi` and `camera: rtsp …`.
 No `/dev/video0` is required.
 
+```bash
+sudo apt install -y ffmpeg sox
+```
+
 Set the Peltor LiteCom Pro III headset and SA828 to the **same analog channel** (Config → Radio). If the headset uses a privacy/CTCSS tone, set the same CTCSS in the app before Program module.
+
+**UART TX/RX** (GPIO14/15): only needed to **Program / Read** the module. Voice alerts need **PTT + audio jack → MIC**, not UART.

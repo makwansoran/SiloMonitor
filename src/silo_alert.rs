@@ -9,7 +9,7 @@
 
 use rppal::gpio::{Gpio, OutputPin};
 use std::path::PathBuf;
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicI8, AtomicU8, Ordering};
 use std::sync::Mutex;
 use std::thread;
@@ -25,8 +25,6 @@ const TX_LEAD_IN: Duration = Duration::from_millis(800);
 const TX_TAIL: Duration = Duration::from_millis(1200);
 /// Never hold the channel longer than this, whatever aplay does.
 const TX_MAX: Duration = Duration::from_secs(20);
-/// Re-announce while the silo stays empty so a busy channel still gets it.
-pub const REPEAT_EVERY: Duration = Duration::from_secs(90);
 
 static TX_BUSY: AtomicBool = AtomicBool::new(false);
 static PTT_PIN: AtomicU8 = AtomicU8::new(0);
@@ -163,35 +161,20 @@ impl SiloAlert {
         self.last_sent_unix
     }
 
-    /// Seconds until the next re-announce, if the silo is still empty.
-    pub fn next_repeat_in(&self) -> Option<u64> {
-        let last = self.last_sent_unix?;
-        let now = now_unix();
-        let every = REPEAT_EVERY.as_secs();
-        Some(every.saturating_sub(now.saturating_sub(last)))
-    }
-
-    /// Announce when the silo turns empty, then repeat while it stays empty.
+    /// Key PTT and play the clip once when the silo becomes empty.
+    /// Staying empty does not re-transmit. Test radio is separate.
     ///
-    /// A restored already-empty state is not "became empty" — only the 90s
-    /// wall-clock cooldown may fire again.
+    /// A restored already-empty state is not "became empty" — no TX on restart.
     pub fn update(&mut self, empty: bool) -> bool {
         let became_empty = empty && !self.was_empty;
         self.was_empty = empty;
-        if !empty {
+        if !became_empty {
             return false;
         }
         if MUTED.load(Ordering::SeqCst) {
             return false;
         }
-        let due = if became_empty {
-            true
-        } else if let Some(u) = self.last_sent_unix {
-            now_unix().saturating_sub(u) >= REPEAT_EVERY.as_secs()
-        } else {
-            false
-        };
-        if !due || !transmit() {
+        if !transmit() {
             return false;
         }
         self.last_sent = Some(Instant::now());
@@ -260,8 +243,19 @@ fn voice_file() -> PathBuf {
 fn set_playback_level() {
     let db = PCM_DB.load(Ordering::SeqCst);
     let level = format!("{db}dB");
+    // Best-effort ALSA level. Real loudness also comes from sox gain in play_voice.
+    for card in ["Headphones", "0", "1"] {
+        let ok = Command::new("/usr/bin/amixer")
+            .args(["-c", card, "sset", "PCM", "--", &level, "unmute"])
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        if ok {
+            return;
+        }
+    }
     let _ = Command::new("/usr/bin/amixer")
-        .args(["-c", "Headphones", "sset", "PCM", "--", &level, "unmute"])
+        .args(["sset", "PCM", "--", &level, "unmute"])
         .output();
 }
 
@@ -279,11 +273,54 @@ pub fn play_voice() -> Result<(), String> {
     }
 
     let device = audio_device();
+    let db = PCM_DB.load(Ordering::SeqCst);
+    // Software gain so Config → TX volume always changes loudness, even when
+    // amixer card names differ on the Pi. Needs sox (`sudo apt install -y sox`).
+    if PathBuf::from("/usr/bin/sox").is_file() {
+        let mut sox = Command::new("/usr/bin/sox")
+            .arg(&wav)
+            .args(["-t", "wav", "-"])
+            .args(["gain", &db.to_string()])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .map_err(|e| format!("sox: {e}"))?;
+        let pipe = sox.stdout.take().ok_or("sox stdout unavailable")?;
+        let mut aplay = Command::new("/usr/bin/aplay")
+            .args(["-D", &device, "-q", "-t", "wav", "-"])
+            .stdin(Stdio::from(pipe))
+            .spawn()
+            .map_err(|e| {
+                let _ = sox.kill();
+                format!("aplay: {e}")
+            })?;
+        let deadline = Instant::now() + TX_MAX;
+        let result = loop {
+            match aplay.try_wait() {
+                Ok(Some(status)) if status.success() => break Ok(()),
+                Ok(Some(status)) => break Err(format!("aplay {status}")),
+                Ok(None) => {
+                    if Instant::now() >= deadline {
+                        let _ = aplay.kill();
+                        let _ = sox.kill();
+                        break Err("aplay timed out".into());
+                    }
+                    thread::sleep(Duration::from_millis(50));
+                }
+                Err(e) => break Err(format!("aplay: {e}")),
+            }
+        };
+        let _ = sox.wait();
+        return result;
+    }
+
     let mut child = Command::new("/usr/bin/aplay")
         .args(["-D", &device, "-q"])
         .arg(&wav)
         .spawn()
-        .map_err(|e| format!("aplay: {e}"))?;
+        .map_err(|e| {
+            format!("aplay: {e} (install sox for TX volume: sudo apt install -y sox)")
+        })?;
 
     let deadline = Instant::now() + TX_MAX;
     loop {
