@@ -322,7 +322,74 @@ fn play_voice_path(override_wav: Option<&PathBuf>) -> Result<(), String> {
     result
 }
 
+/// PCM WAV duration from the `fmt` + `data` chunks (no extra crates).
+fn wav_pcm_duration(path: &PathBuf) -> Result<Duration, String> {
+    use std::fs::File;
+    use std::io::{Read, Seek, SeekFrom};
+
+    let mut f = File::open(path).map_err(|e| format!("wav open: {e}"))?;
+    let mut riff = [0u8; 12];
+    f.read_exact(&mut riff)
+        .map_err(|e| format!("wav header: {e}"))?;
+    if &riff[0..4] != b"RIFF" || &riff[8..12] != b"WAVE" {
+        return Err("not a WAV file".into());
+    }
+
+    let mut sample_rate = 0u32;
+    let mut channels = 0u16;
+    let mut bits = 0u16;
+    let mut data_bytes = None;
+
+    loop {
+        let mut chunk = [0u8; 8];
+        if f.read_exact(&mut chunk).is_err() {
+            break;
+        }
+        let id = &chunk[0..4];
+        let size = u32::from_le_bytes([chunk[4], chunk[5], chunk[6], chunk[7]]);
+        if id == b"fmt " {
+            let mut fmt = vec![0u8; size as usize];
+            f.read_exact(&mut fmt)
+                .map_err(|e| format!("wav fmt: {e}"))?;
+            if fmt.len() < 16 {
+                return Err("wav fmt too short".into());
+            }
+            channels = u16::from_le_bytes([fmt[2], fmt[3]]);
+            sample_rate = u32::from_le_bytes([fmt[4], fmt[5], fmt[6], fmt[7]]);
+            bits = u16::from_le_bytes([fmt[14], fmt[15]]);
+        } else if id == b"data" {
+            data_bytes = Some(size);
+            break;
+        } else {
+            f.seek(SeekFrom::Current(i64::from(size)))
+                .map_err(|e| format!("wav seek: {e}"))?;
+        }
+        if size % 2 == 1 {
+            let _ = f.seek(SeekFrom::Current(1));
+        }
+    }
+
+    let data_bytes = data_bytes.ok_or_else(|| "wav missing data chunk".to_string())?;
+    if sample_rate == 0 || channels == 0 || bits == 0 || bits % 8 != 0 {
+        return Err("wav invalid format".into());
+    }
+    let bytes_per_frame = u64::from(channels) * u64::from(bits / 8);
+    if bytes_per_frame == 0 {
+        return Err("wav invalid frame size".into());
+    }
+    let frames = u64::from(data_bytes) / bytes_per_frame;
+    let nanos = frames
+        .checked_mul(1_000_000_000)
+        .and_then(|n| n.checked_div(u64::from(sample_rate)))
+        .ok_or_else(|| "wav duration overflow".to_string())?;
+    Ok(Duration::from_nanos(nanos))
+}
+
 fn play_voice_keyed(wav: &PathBuf) -> Result<(), String> {
+    let duration = wav_pcm_duration(wav)?;
+    // Unkey 1 ms before the last sample so TX dies with the clip, not after.
+    let release_after = duration.saturating_sub(Duration::from_millis(1));
+
     let tx = Ptt::key()?;
     if !tx.is_keyed() {
         return Err("PTT did not go low".into());
@@ -335,19 +402,35 @@ fn play_voice_keyed(wav: &PathBuf) -> Result<(), String> {
         .spawn()
         .map_err(|e| format!("aplay: {e}"))?;
 
-    let deadline = Instant::now() + TX_MAX;
+    let started = Instant::now();
+    let deadline = started + TX_MAX;
+    let mut ptt = Some(tx);
+
     loop {
         match child.try_wait() {
-            Ok(Some(status)) if status.success() => break Ok(()),
-            Ok(Some(status)) => break Err(format!("aplay {status}")),
+            Ok(Some(status)) => {
+                drop(ptt.take());
+                return if status.success() {
+                    Ok(())
+                } else {
+                    Err(format!("aplay {status}"))
+                };
+            }
             Ok(None) => {
+                if ptt.is_some() && started.elapsed() >= release_after {
+                    drop(ptt.take());
+                }
                 if Instant::now() >= deadline {
                     let _ = child.kill();
-                    break Err("aplay timed out".into());
+                    drop(ptt.take());
+                    return Err("aplay timed out".into());
                 }
-                thread::sleep(Duration::from_millis(50));
+                thread::sleep(Duration::from_millis(1));
             }
-            Err(e) => break Err(format!("aplay: {e}")),
+            Err(e) => {
+                drop(ptt.take());
+                return Err(format!("aplay: {e}"));
+            }
         }
     }
 }
