@@ -18,6 +18,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const DEFAULT_AUDIO: &str = "plughw:CARD=Headphones,DEV=0";
 const VOICE_REL: &str = "audio/silo_is_empty_vox.wav";
+const VOLUME_TEST_DIR: &str = "audio/volume_tests";
 const INSTALL_DIR: &str = "/home/spectr/silo-alert";
 /// The module needs time to key before it will modulate.
 const TX_LEAD_IN: Duration = Duration::from_millis(800);
@@ -25,6 +26,15 @@ const TX_LEAD_IN: Duration = Duration::from_millis(800);
 const TX_TAIL: Duration = Duration::from_millis(150);
 /// Never hold the channel longer than this, whatever aplay does.
 const TX_MAX: Duration = Duration::from_secs(20);
+
+/// Known volume-test clips (filename stem → UI label). Scan order = list order.
+const VOLUME_TEST_CLIPS: &[(&str, &str)] = &[
+    ("silo_is_empty_vox_vol_01_very_low", "Very low"),
+    ("silo_is_empty_vox_vol_02_low", "Low"),
+    ("silo_is_empty_vox_vol_03_medium", "Medium"),
+    ("silo_is_empty_vox_vol_04_high", "High"),
+    ("silo_is_empty_vox_vol_05_very_high", "Very high"),
+];
 
 static TX_BUSY: AtomicBool = AtomicBool::new(false);
 static PTT_PIN: AtomicU8 = AtomicU8::new(0);
@@ -189,8 +199,9 @@ impl SiloAlert {
     }
 
     /// Test radio: PTT + WAV once, then idle. Works when disarmed.
-    pub fn test_transmit(&mut self) -> Result<(), String> {
-        if transmit() {
+    /// `wav` overrides the production empty clip (volume-test files).
+    pub fn test_transmit(&mut self, wav: Option<PathBuf>) -> Result<(), String> {
+        if transmit_wav(wav) {
             Ok(())
         } else {
             Err("Already transmitting".into())
@@ -207,15 +218,25 @@ fn now_unix() -> u64 {
 
 /// Transmit on a worker thread. False if one is already running.
 fn transmit() -> bool {
+    transmit_wav(None)
+}
+
+fn transmit_wav(wav: Option<PathBuf>) -> bool {
     if TX_BUSY
         .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
         .is_err()
     {
         return false;
     }
-    thread::spawn(|| {
-        let msg = match play_voice() {
-            Ok(()) => "Played silo is empty".to_string(),
+    thread::spawn(move || {
+        let label = wav
+            .as_ref()
+            .and_then(|p| p.file_stem())
+            .and_then(|s| s.to_str())
+            .map(|s| volume_test_label(s).unwrap_or(s).to_string())
+            .unwrap_or_else(|| "silo is empty".into());
+        let msg = match play_voice_path(wav.as_ref()) {
+            Ok(()) => format!("Played {label}"),
             Err(e) => {
                 eprintln!("radio: {e}");
                 e
@@ -227,27 +248,78 @@ fn transmit() -> bool {
     true
 }
 
-fn voice_file() -> PathBuf {
+fn resolve_rel(rel: &str) -> PathBuf {
     let mut candidates = Vec::new();
     if let Ok(cwd) = std::env::current_dir() {
-        candidates.push(cwd.join(VOICE_REL));
+        candidates.push(cwd.join(rel));
     }
     if let Ok(exe) = std::env::current_exe() {
         if let Some(root) = exe.ancestors().nth(3) {
-            candidates.push(root.join(VOICE_REL));
+            candidates.push(root.join(rel));
         }
     }
-    candidates.push(PathBuf::from(INSTALL_DIR).join(VOICE_REL));
+    candidates.push(PathBuf::from(INSTALL_DIR).join(rel));
     candidates
         .into_iter()
-        .find(|p| p.is_file())
-        .unwrap_or_else(|| PathBuf::from(INSTALL_DIR).join(VOICE_REL))
+        .find(|p| p.is_file() || p.is_dir())
+        .unwrap_or_else(|| PathBuf::from(INSTALL_DIR).join(rel))
+}
+
+fn voice_file() -> PathBuf {
+    resolve_rel(VOICE_REL)
+}
+
+fn volume_test_dir() -> PathBuf {
+    resolve_rel(VOLUME_TEST_DIR)
+}
+
+fn volume_test_label(stem: &str) -> Option<&'static str> {
+    VOLUME_TEST_CLIPS
+        .iter()
+        .find(|(name, _)| *name == stem)
+        .map(|(_, label)| *label)
+}
+
+/// Volume-test clips for the Radio config Test radio picker.
+/// Returns `(filename, label)` pairs that exist on disk.
+pub fn volume_test_files() -> Vec<(String, String)> {
+    let dir = volume_test_dir();
+    let mut out = Vec::new();
+    for &(stem, label) in VOLUME_TEST_CLIPS {
+        let name = format!("{stem}.wav");
+        if dir.join(&name).is_file() {
+            out.push((name, label.to_string()));
+        }
+    }
+    out
+}
+
+/// Resolve a volume-test filename under `audio/volume_tests/`.
+pub fn volume_test_path(filename: &str) -> Option<PathBuf> {
+    let name = filename.trim();
+    if name.is_empty() || name.contains('/') || name.contains('\\') || name.contains("..") {
+        return None;
+    }
+    let path = volume_test_dir().join(name);
+    path.is_file().then_some(path)
 }
 
 /// Key PTT → play WAV once at system volume → High-Z idle.
 /// Does not touch ALSA/PCM levels — operator sets volume on the Pi.
 pub fn play_voice() -> Result<(), String> {
-    let wav = voice_file();
+    play_voice_path(None)
+}
+
+/// Same as [`play_voice`], but plays a specific WAV (volume-test clips).
+pub fn play_voice_file(wav: &std::path::Path) -> Result<(), String> {
+    play_voice_path(Some(&wav.to_path_buf()))
+}
+
+fn play_voice_path(override_wav: Option<&PathBuf>) -> Result<(), String> {
+    let wav = match override_wav {
+        Some(p) => p.clone(),
+        None => voice_file(),
+    };
     if !wav.is_file() {
         return Err(format!("Missing {}", wav.display()));
     }

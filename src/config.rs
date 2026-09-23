@@ -121,6 +121,12 @@ pub struct RadioCfg {
     /// Laptop (no GPIO) defaults muted so a bench run never keys a radio.
     #[serde(default = "default_muted")]
     pub muted: bool,
+    /// When true, Test radio plays a volume-test WAV instead of the production clip.
+    #[serde(default)]
+    pub volume_test_mode: bool,
+    /// Filename under `audio/volume_tests/` used when volume_test_mode is on.
+    #[serde(default)]
+    pub volume_test_file: String,
 }
 
 impl Default for RadioCfg {
@@ -134,6 +140,8 @@ impl Default for RadioCfg {
             ptt_gpio: default_ptt_gpio(),
             audio_device: default_audio_device(),
             muted: default_muted(),
+            volume_test_mode: false,
+            volume_test_file: String::new(),
         }
     }
 }

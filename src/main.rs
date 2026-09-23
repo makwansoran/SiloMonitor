@@ -712,6 +712,54 @@ impl App {
             silo_alert::set_muted(self.cfg.radio.muted);
         }
 
+        ui.add_space(10.0);
+        ui.checkbox(
+            &mut self.cfg.radio.volume_test_mode,
+            "Volume test sounds",
+        );
+        if self.cfg.radio.volume_test_mode {
+            ui.add_space(4.0);
+            let clips = silo_alert::volume_test_files();
+            if clips.is_empty() {
+                ui.label(
+                    RichText::new("No files in audio/volume_tests/")
+                        .size(11.0)
+                        .color(MUTED),
+                );
+            } else {
+                if self.cfg.radio.volume_test_file.is_empty()
+                    || !clips.iter().any(|(f, _)| f == &self.cfg.radio.volume_test_file)
+                {
+                    self.cfg.radio.volume_test_file = clips[0].0.clone();
+                }
+                let current = self.cfg.radio.volume_test_file.clone();
+                let current_label = clips
+                    .iter()
+                    .find(|(f, _)| f == &current)
+                    .map(|(_, l)| l.as_str())
+                    .unwrap_or(current.as_str());
+                ui.label(RichText::new("Test clip").size(12.0).color(MUTED));
+                egui::ComboBox::from_id_salt("volume_test_clip")
+                    .width(ui.available_width())
+                    .selected_text(current_label)
+                    .show_ui(ui, |ui| {
+                        for (file, label) in &clips {
+                            ui.selectable_value(
+                                &mut self.cfg.radio.volume_test_file,
+                                file.clone(),
+                                label,
+                            );
+                        }
+                    });
+                ui.add_space(4.0);
+                ui.label(
+                    RichText::new("Only used by Test radio — empty alerts still use the normal clip.")
+                        .size(11.0)
+                        .color(MUTED),
+                );
+            }
+        }
+
         ui.add_space(14.0);
         row_stat(ui, "Alerts sent", &self.stats.alerts_sent.to_string());
         row_stat(
@@ -737,11 +785,12 @@ impl App {
             self.test_radio();
         }
         ui.add_space(4.0);
-        ui.label(
-            RichText::new("Test radio: PTT LOW → play WAV once → High-Z idle.")
-                .size(11.0)
-                .color(MUTED),
-        );
+        let test_hint = if self.cfg.radio.volume_test_mode {
+            "Test radio: PTT LOW → play selected volume-test WAV → High-Z idle."
+        } else {
+            "Test radio: PTT LOW → play WAV once → High-Z idle."
+        };
+        ui.label(RichText::new(test_hint).size(11.0).color(MUTED));
     }
 
     fn apply_peltor_channel(&mut self) {
@@ -1406,9 +1455,30 @@ impl App {
     }
 
     fn test_radio(&mut self) {
+        let wav = if self.cfg.radio.volume_test_mode {
+            match silo_alert::volume_test_path(&self.cfg.radio.volume_test_file) {
+                Some(p) => Some(p),
+                None => {
+                    self.note = if self.cfg.radio.volume_test_file.is_empty() {
+                        "Pick a volume-test clip first".into()
+                    } else {
+                        format!(
+                            "Missing volume-test file: {}",
+                            self.cfg.radio.volume_test_file
+                        )
+                    };
+                    return;
+                }
+            }
+        } else {
+            None
+        };
         let result = match self.alert.as_mut() {
-            Some(a) => a.test_transmit(),
-            None => silo_alert::play_voice(),
+            Some(a) => a.test_transmit(wav.clone()),
+            None => match &wav {
+                Some(p) => silo_alert::play_voice_file(p),
+                None => silo_alert::play_voice(),
+            },
         };
         self.note = match result {
             Ok(()) => "Transmitting…".into(),
