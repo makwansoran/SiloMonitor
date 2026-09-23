@@ -387,8 +387,8 @@ fn wav_pcm_duration(path: &PathBuf) -> Result<Duration, String> {
 
 fn play_voice_keyed(wav: &PathBuf) -> Result<(), String> {
     let duration = wav_pcm_duration(wav)?;
-    // Unkey 2 s before the last sample so TX dies before the clip ends.
-    let release_after = duration.saturating_sub(Duration::from_secs(2));
+    // Unkey 0.5 s before the last sample so TX dies before the clip ends.
+    let release_after = duration.saturating_sub(Duration::from_millis(500));
 
     let tx = Ptt::key()?;
     if !tx.is_keyed() {
