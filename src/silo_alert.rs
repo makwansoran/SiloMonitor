@@ -20,10 +20,6 @@ const DEFAULT_AUDIO: &str = "plughw:CARD=Headphones,DEV=0";
 const VOICE_REL: &str = "audio/silo_is_empty_vox.wav";
 const VOLUME_TEST_DIR: &str = "audio/volume_tests";
 const INSTALL_DIR: &str = "/home/spectr/silo-alert";
-/// The module needs time to key before it will modulate.
-const TX_LEAD_IN: Duration = Duration::from_millis(800);
-/// Brief hang so the last syllable clears the channel — then PTT goes High-Z.
-const TX_TAIL: Duration = Duration::from_millis(150);
 /// Never hold the channel longer than this, whatever aplay does.
 const TX_MAX: Duration = Duration::from_secs(20);
 
@@ -121,16 +117,13 @@ fn key_ptt_pin() -> Result<Option<OutputPin>, String> {
     Ok(Some(out))
 }
 
-/// Keys the transmitter while alive; Drop returns the pin to High-Z (no 3.3 V).
+/// Keys the transmitter while alive; Drop returns the pin to High-Z immediately (no 3.3 V).
 struct Ptt(Option<OutputPin>);
 
 impl Ptt {
     fn key() -> Result<Self, String> {
-        let out = key_ptt_pin()?;
-        if out.is_some() {
-            thread::sleep(TX_LEAD_IN);
-        }
-        Ok(Self(out))
+        // No lead-in: key and start audio immediately.
+        Ok(Self(key_ptt_pin()?))
     }
 
     fn is_keyed(&self) -> bool {
@@ -140,7 +133,7 @@ impl Ptt {
 
 impl Drop for Ptt {
     fn drop(&mut self) {
-        thread::sleep(TX_TAIL);
+        // No tail: release PTT the moment aplay finishes.
         // Do not set_high() — that drives 3.3 V into SA828 PTT.
         drop(self.0.take());
         release_ptt();
