@@ -505,6 +505,10 @@ impl App {
             .size(11.0)
             .color(MUTED),
         );
+        if let Some(warn) = self.reference.as_ref().and_then(|r| r.cohesion_warning()) {
+            ui.add_space(4.0);
+            ui.label(RichText::new(warn).size(11.0).color(RED));
+        }
         if self.cfg.level.empty_match_threshold > 0.0 {
             ui.add_space(4.0);
             if quiet_btn(ui, "Auto").clicked() {
@@ -523,6 +527,10 @@ impl App {
                     "Photos agree",
                     &format!("{:.0}%", r.cohesion * 100.0),
                 );
+                if let Some(warn) = r.cohesion_warning() {
+                    ui.add_space(4.0);
+                    ui.label(RichText::new(warn).size(11.0).color(RED));
+                }
                 row_stat(ui, "Built", &fmt_dt(r.built_at_unix));
                 row_stat(
                     ui,
@@ -947,6 +955,10 @@ impl App {
                 .map(|r| format!("{:.0}%", r.cohesion * 100.0))
                 .unwrap_or_else(|| "—".into()),
         );
+        if let Some(warn) = self.reference.as_ref().and_then(|r| r.cohesion_warning()) {
+            ui.add_space(4.0);
+            ui.label(RichText::new(warn).size(11.0).color(RED));
+        }
         row_stat(
             ui,
             "Built",
@@ -1446,8 +1458,12 @@ impl App {
                 self.stats.last_train_unix = Some(r.built_at_unix);
                 self.stats.last_train_accuracy = Some(r.cohesion);
                 self.stats.save();
+                let warn = r.cohesion_warning();
                 self.reference = Some(r);
-                self.note = format!("Reference updated — {n} photos");
+                self.note = match warn {
+                    Some(w) => format!("Reference updated — {n} photos. {w}"),
+                    None => format!("Reference updated — {n} photos"),
+                };
                 self.term_line(Self::term_now(&format!("reference updated ({n} photos)")));
             }
             Err(e) => self.note = e,
@@ -2313,6 +2329,10 @@ impl eframe::App for App {
                                             "Photos agree",
                                             &format!("{:.0}%", r.cohesion * 100.0),
                                         );
+                                        if let Some(warn) = r.cohesion_warning() {
+                                            ui.add_space(4.0);
+                                            ui.label(RichText::new(warn).size(11.0).color(RED));
+                                        }
                                         row_stat(ui, "Built", &fmt_dt(r.built_at_unix));
                                     }
                                     None => {

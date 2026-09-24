@@ -142,14 +142,48 @@ impl Reference {
 
     /// Where to draw the line, unless the operator overrides it.
     ///
-    /// Reference photos taken seconds apart look almost identical, which
-    /// would put the bar so high that nothing ever clears it. The margin is
-    /// therefore never smaller than [`MIN_MARGIN`], whatever the photos say.
+    /// High cohesion (consistent empty photos): sit a modest margin below that
+    /// agreement so live empties still clear the bar.
+    ///
+    /// Low cohesion (noisy / disagreeing references): keep the bar **strict**.
+    /// Widening the margin used to clamp toward 0.50 and made false "empty"
+    /// calls more likely — the opposite of what bad reference data needs.
     pub fn suggested_threshold(&self) -> f32 {
-        const MIN_MARGIN: f32 = 0.10;
-        let spread = 1.0 - self.cohesion;
-        let margin = (spread * 3.0).max(MIN_MARGIN);
-        (self.cohesion - margin).clamp(0.50, 0.95)
+        const NOMINAL_MARGIN: f32 = 0.10;
+        const MAX_MARGIN: f32 = 0.12;
+        let spread = (1.0 - self.cohesion).max(0.0);
+        let margin = (NOMINAL_MARGIN + spread * 0.5).min(MAX_MARGIN);
+        let raw = self.cohesion - margin;
+
+        // Poor agreement → raise the floor (harder to call empty), not lower it.
+        let floor = if self.cohesion >= 0.90 {
+            0.70
+        } else if self.cohesion >= 0.85 {
+            0.80
+        } else {
+            0.85
+        };
+        raw.clamp(floor, 0.95)
+    }
+
+    /// Operator-facing data-quality note; `None` when references look consistent.
+    pub fn cohesion_warning(&self) -> Option<&'static str> {
+        if self.frames.len() < 2 {
+            return None;
+        }
+        if self.cohesion < 0.80 {
+            Some(
+                "Reference photos disagree — retake empty photos. Auto threshold stays strict to avoid false empties.",
+            )
+        } else if self.cohesion < 0.85 {
+            Some(
+                "Reference photos only partly agree — retake for a tighter empty model. Auto threshold stays strict.",
+            )
+        } else if self.cohesion < 0.90 {
+            Some("Reference photos partly agree — prefer retaking for a more reliable empty model.")
+        } else {
+            None
+        }
     }
 }
 
