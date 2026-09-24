@@ -79,6 +79,9 @@ struct App {
     empty_alerts: Vec<u64>,
     empty_since: Option<u64>,
     empty: bool,
+    /// Consecutive non-empty checks while sticky-empty (filled confirm).
+    full_streak: u32,
+    full_since: Option<u64>,
     note: String,
     samples: Vec<SampleMeta>,
     sample_idx: Option<usize>,
@@ -192,6 +195,8 @@ impl App {
             empty_alerts,
             empty_since: resume_empty_since,
             empty: resume_empty,
+            full_streak: 0,
+            full_since: None,
             note: String::new(),
             samples: vision::list_references(),
             sample_idx: None,
@@ -263,6 +268,8 @@ impl App {
                     self.empty = false;
                     self.empty_since = None;
                     self.empty_streak = 0;
+                    self.full_since = None;
+                    self.full_streak = 0;
                     self.stats.empty_state = false;
                     self.stats.empty_since_unix = None;
                     self.stats.save();
@@ -329,6 +336,8 @@ impl App {
             self.last_match = None;
             self.empty_since = None;
             self.empty_streak = 0;
+            self.full_since = None;
+            self.full_streak = 0;
             // A dead camera must never look like a healthy silo.
             self.empty = false;
             self.stats.empty_state = false;
@@ -472,10 +481,18 @@ impl App {
         );
         labeled_slider(
             ui,
-            "Empty must last",
+            "State must last",
             &mut self.cfg.level.empty_confirmation_seconds,
             15.0..=120.0,
             "s",
+        );
+        ui.add_space(4.0);
+        ui.label(
+            RichText::new(
+                "Applies both ways: empty before alert, and full again before the radio latch clears.",
+            )
+            .size(11.0)
+            .color(MUTED),
         );
 
         ui.add_space(10.0);
@@ -1111,6 +1128,8 @@ impl App {
             self.last_match = None;
             self.empty = false;
             self.empty_since = None;
+            self.full_since = None;
+            self.full_streak = 0;
             // Say it once, not every cycle.
             if !self.warned_no_reference {
                 self.warned_no_reference = true;
@@ -1129,7 +1148,11 @@ impl App {
         self.last_match = Some(score);
 
         let threshold = self.match_threshold();
+        // Enter empty at `threshold`; leave only clearly below it (hysteresis)
+        // so flicker on the line cannot clear the radio latch in one frame.
+        const CLEAR_HYSTERESIS: f32 = 0.03;
         let looks_empty = score >= threshold;
+        let looks_full = score < (threshold - CLEAR_HYSTERESIS).max(0.0);
 
         let unix = eventlog::now_unix();
         let interval = self.cfg.level.check_interval_seconds.max(1.0);
@@ -1143,9 +1166,20 @@ impl App {
             if self.empty_since.is_none() {
                 self.empty_since = Some(unix);
             }
+            self.full_streak = 0;
+            self.full_since = None;
         } else {
             self.empty_streak = 0;
             self.empty_since = None;
+            if looks_full && self.empty {
+                self.full_streak = self.full_streak.saturating_add(1);
+                if self.full_since.is_none() {
+                    self.full_since = Some(unix);
+                }
+            } else {
+                self.full_streak = 0;
+                self.full_since = None;
+            }
         }
 
         let long_enough = self
@@ -1154,8 +1188,15 @@ impl App {
             .unwrap_or(false);
         let confirmed = looks_empty && long_enough && self.empty_streak >= need_streak;
 
+        let filled_long_enough = self
+            .full_since
+            .map(|t| unix.saturating_sub(t) >= need)
+            .unwrap_or(false);
+        let filled_confirmed =
+            looks_full && filled_long_enough && self.full_streak >= need_streak;
+
         let just_confirmed = self.armed && confirmed && !self.empty;
-        let just_filled = self.armed && !looks_empty && self.empty;
+        let just_filled = self.armed && filled_confirmed && self.empty;
 
         let mut alerted = false;
         if just_confirmed {
@@ -1183,6 +1224,8 @@ impl App {
             }
         } else if just_filled {
             self.empty = false;
+            self.full_streak = 0;
+            self.full_since = None;
             self.events.state(unix, "level_state", "EMPTY", "OK", "");
             if let Some(alert) = &mut self.alert {
                 alert.on_filled();

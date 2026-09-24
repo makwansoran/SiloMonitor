@@ -63,6 +63,7 @@ impl Default for CameraCfg {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct LevelCfg {
     /// The silo must look empty this long before an alert goes out.
+    /// The same window applies when clearing sticky-empty (filled confirm).
     #[serde(default = "d15f")]
     pub empty_confirmation_seconds: f32,
     /// One comparison every N seconds.

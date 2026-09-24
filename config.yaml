@@ -10,7 +10,7 @@ camera:
 level:
   # One comparison against the empty reference every N seconds.
   check_interval_seconds: 15
-  # The silo must look empty this long before the alert goes out.
+  # Must hold this long to confirm empty (alert) or full again (clear radio latch).
   empty_confirmation_seconds: 15
   # How closely a frame must match the empty reference.
   # 0 = derive it from how alike the reference photos already are.
