@@ -501,14 +501,14 @@ pub fn list_full_samples() -> Vec<SampleMeta> {
     out
 }
 
-/// How close the nearest full sample sits to the empty alert line.
-/// None when there are no full samples. 0 = safely below, 1 = would trip.
-pub fn false_empty_risk(reference: &Reference, threshold: f32) -> Option<f32> {
+/// Highest similarity any full sample scores against the empty reference.
+/// `None` when there are no readable full samples.
+pub fn max_full_similarity(reference: &Reference) -> Option<f32> {
     let fulls = list_full_samples();
     if fulls.is_empty() {
         return None;
     }
-    let mut worst = 0.0f32;
+    let mut worst = None;
     for meta in fulls {
         let img = match image::open(&meta.path) {
             Ok(i) => i.to_rgb8(),
@@ -518,9 +518,48 @@ pub fn false_empty_risk(reference: &Reference, threshold: f32) -> Option<f32> {
         let rgb = img.into_raw();
         let feat = features_in_roi(w, h, &rgb, reference.roi);
         let feat_bw = bw_features(w, h, &rgb, reference.roi, Some(reference.bw_threshold));
-        worst = worst.max(reference.similarity_pair(&feat, &feat_bw));
+        let score = reference.similarity_pair(&feat, &feat_bw);
+        worst = Some(worst.map_or(score, |w: f32| w.max(score)));
     }
-    Some(((worst - (threshold - 0.08)) / 0.16).clamp(0.0, 1.0))
+    worst
+}
+
+/// Keep the empty line above the closest full sample by [`FULL_SAMPLE_MARGIN`].
+pub const FULL_SAMPLE_MARGIN: f32 = 0.08;
+
+pub fn enforce_full_sample_floor(base: f32, reference: &Reference) -> f32 {
+    match max_full_similarity(reference) {
+        Some(worst) => base.max(worst + FULL_SAMPLE_MARGIN).clamp(0.50, 0.95),
+        None => base.clamp(0.50, 0.95),
+    }
+}
+
+/// How close the nearest full sample sits to the empty alert line.
+/// None when there are no full samples. 0 = safely below, 1 = would trip.
+pub fn false_empty_risk(reference: &Reference, threshold: f32) -> Option<f32> {
+    let worst = max_full_similarity(reference)?;
+    Some(((worst - (threshold - FULL_SAMPLE_MARGIN)) / (FULL_SAMPLE_MARGIN * 2.0)).clamp(0.0, 1.0))
+}
+
+/// When full samples force the line up, or sit dangerously close to empty cohesion.
+pub fn full_sample_warning(reference: &Reference, base_threshold: f32) -> Option<String> {
+    let worst = max_full_similarity(reference)?;
+    let floor = (worst + FULL_SAMPLE_MARGIN).min(0.95);
+    if floor > base_threshold + 0.005 {
+        Some(format!(
+            "Threshold raised to {:.0}% — a full sample scores {:.0}% (need ≥{:.0}% margin).",
+            floor * 100.0,
+            worst * 100.0,
+            FULL_SAMPLE_MARGIN * 100.0
+        ))
+    } else if worst + FULL_SAMPLE_MARGIN > reference.cohesion {
+        Some(format!(
+            "Full samples score up to {:.0}% — empty and full look alike; retake photos or tighten the region.",
+            worst * 100.0
+        ))
+    } else {
+        None
+    }
 }
 
 pub fn save_alert_evidence(

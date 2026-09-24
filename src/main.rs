@@ -497,15 +497,16 @@ impl App {
 
         ui.add_space(10.0);
         ui.label(RichText::new("Match threshold").size(12.0).color(MUTED));
-        let suggested = self
+        let base_suggested = self
             .reference
             .as_ref()
             .map(|r| r.suggested_threshold())
             .unwrap_or(0.95);
+        let effective = self.match_threshold();
         let mut pct = if self.cfg.level.empty_match_threshold > 0.0 {
             self.cfg.level.empty_match_threshold * 100.0
         } else {
-            suggested * 100.0
+            effective * 100.0
         };
         if ui
             .add(egui::Slider::new(&mut pct, 70.0..=99.5).suffix(" %"))
@@ -516,13 +517,22 @@ impl App {
         ui.add_space(4.0);
         ui.label(
             RichText::new(format!(
-                "Suggested {:.0}% — from how alike the reference photos are.",
-                suggested * 100.0
+                "Suggested {:.0}% from empty photos — effective {:.0}% (full samples can raise it).",
+                base_suggested * 100.0,
+                effective * 100.0
             ))
             .size(11.0)
             .color(MUTED),
         );
         if let Some(warn) = self.reference.as_ref().and_then(|r| r.cohesion_warning()) {
+            ui.add_space(4.0);
+            ui.label(RichText::new(warn).size(11.0).color(RED));
+        }
+        if let Some(warn) = self
+            .reference
+            .as_ref()
+            .and_then(|r| vision::full_sample_warning(r, self.base_match_threshold()))
+        {
             ui.add_space(4.0);
             ui.label(RichText::new(warn).size(11.0).color(RED));
         }
@@ -987,6 +997,14 @@ impl App {
         );
         if let Some(risk) = self.false_empty_risk() {
             row_stat(ui, "False-empty risk", &risk);
+        }
+        if let Some(warn) = self
+            .reference
+            .as_ref()
+            .and_then(|r| vision::full_sample_warning(r, self.base_match_threshold()))
+        {
+            ui.add_space(4.0);
+            ui.label(RichText::new(warn).size(11.0).color(RED));
         }
 
         ui.add_space(16.0);
@@ -1463,9 +1481,17 @@ impl App {
         Some(((score - self.match_threshold()).abs() / spread).clamp(0.0, 1.0))
     }
 
-    /// Where the line sits: the operator's setting, or the spread of the
-    /// reference photos themselves when they have not set one.
+    /// Where the line sits: operator setting or auto suggestion, then raised
+    /// if any full sample would sit too close to that line.
     fn match_threshold(&self) -> f32 {
+        let base = self.base_match_threshold();
+        match self.reference.as_ref() {
+            Some(r) => vision::enforce_full_sample_floor(base, r),
+            None => base,
+        }
+    }
+
+    fn base_match_threshold(&self) -> f32 {
         let set = self.cfg.level.empty_match_threshold;
         if set > 0.0 {
             return set;
@@ -2399,6 +2425,16 @@ impl eframe::App for App {
                                 );
                                 if let Some(risk) = self.false_empty_risk() {
                                     row_stat(ui, "False-empty risk", &risk);
+                                }
+                                if let Some(warn) = self
+                                    .reference
+                                    .as_ref()
+                                    .and_then(|r| {
+                                        vision::full_sample_warning(r, self.base_match_threshold())
+                                    })
+                                {
+                                    ui.add_space(4.0);
+                                    ui.label(RichText::new(warn).size(11.0).color(RED));
                                 }
 
                                 if self.region_changed() {
