@@ -670,24 +670,39 @@ impl App {
         if ch != self.cfg.radio.channel {
             self.cfg.radio.channel = ch;
             self.apply_peltor_channel();
+            // RF only changes on the module after UART program — do it now.
+            self.program_sender();
         }
         ui.add_space(4.0);
         row_stat(ui, "SA828 freq", &self.cfg.radio.frequency_mhz);
+        ui.add_space(4.0);
+        ui.label(
+            RichText::new("Changing channel programs the SA828 over UART immediately.")
+                .size(11.0)
+                .color(MUTED),
+        );
         ui.add_space(10.0);
 
         {
             let mut sq = self.cfg.radio.squelch as f32;
             ui.label(RichText::new("Squelch").size(12.0).color(MUTED));
-            ui.add(
+            let sq_resp = ui.add(
                 egui::Slider::new(&mut sq, 0.0..=8.0)
                     .integer()
                     .suffix("  (0=open hiss, 1=normal)"),
             );
-            self.cfg.radio.squelch = sq as u8;
+            let new_sq = sq as u8;
+            if new_sq != self.cfg.radio.squelch {
+                self.cfg.radio.squelch = new_sq;
+            }
+            if sq_resp.drag_stopped() {
+                self.program_sender();
+            }
         }
         ui.add_space(10.0);
 
         self.cfg.radio.ctcss = peltor::clamp_ctcss(self.cfg.radio.ctcss);
+        let prev_ctcss = self.cfg.radio.ctcss;
         ui.label(RichText::new("CTCSS").size(12.0).color(MUTED));
         egui::ComboBox::from_id_salt("peltor_ctcss")
             .width(ui.available_width())
@@ -699,6 +714,9 @@ impl App {
                     ui.selectable_value(&mut self.cfg.radio.ctcss, idx, label);
                 }
             });
+        if self.cfg.radio.ctcss != prev_ctcss {
+            self.program_sender();
+        }
         ui.add_space(6.0);
         ui.label(
             RichText::new(
@@ -811,6 +829,14 @@ impl App {
         if pill(ui, "Program module").clicked() {
             self.program_sender();
         }
+        ui.add_space(4.0);
+        ui.label(
+            RichText::new(
+                "Program writes the selected channel frequency to all 16 SA828 memories. Also runs automatically when you change Channel / CTCSS / Squelch.",
+            )
+            .size(11.0)
+            .color(MUTED),
+        );
         ui.add_space(8.0);
         if pill(ui, "Read module").clicked() {
             self.read_radio();
@@ -1573,6 +1599,7 @@ impl App {
 
     fn program_sender(&mut self) {
         self.apply_peltor_channel();
+        let ch = self.cfg.radio.channel;
         match sa828::program(
             &self.cfg.radio.frequency_mhz,
             self.cfg.radio.squelch,
@@ -1581,9 +1608,13 @@ impl App {
         ) {
             Ok(msg) => {
                 let _ = self.cfg.save();
-                self.note = msg;
+                self.note = format!("Ch {ch} programmed.\n{msg}");
             }
-            Err(e) => self.note = e,
+            Err(e) => {
+                self.note = format!(
+                    "SA828 program failed (Ch {ch} saved in config only): {e}"
+                );
+            }
         }
     }
 
@@ -1601,7 +1632,23 @@ impl App {
         silo_alert::set_audio_device(&self.cfg.radio.audio_device);
         silo_alert::set_muted(self.cfg.radio.muted);
         match self.cfg.save() {
-            Ok(()) => self.note = "Saved".into(),
+            Ok(()) => {
+                // Push RF settings so Save never leaves the module on a stale channel.
+                match sa828::program(
+                    &self.cfg.radio.frequency_mhz,
+                    self.cfg.radio.squelch,
+                    self.cfg.radio.ctcss,
+                    &self.cfg.radio.uart_port,
+                ) {
+                    Ok(msg) => {
+                        self.note = format!("Saved. Ch {} programmed.\n{msg}", self.cfg.radio.channel)
+                    }
+                    Err(e) => {
+                        self.note =
+                            format!("Saved config, but SA828 program failed: {e}")
+                    }
+                }
+            }
             Err(e) => self.note = e,
         }
     }

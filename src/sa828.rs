@@ -45,7 +45,7 @@ pub fn program(freq: &str, squelch: u8, ctcss: u8, port: &str) -> Result<String,
     let info = read_on(&path)?;
     let tone_lbl = peltor::ctcss_label(tone);
     Ok(format!(
-        "UART programmed {path}\n  {freq} MHz  squelch {sq}  CTCSS {tone_lbl}\n  {info}"
+        "UART programmed {path}\n  Ch freq {freq} MHz  squelch {sq}  CTCSS {tone_lbl}\n  {info}"
     ))
 }
 
