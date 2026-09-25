@@ -450,6 +450,20 @@ pub fn save_rgb_jpeg(path: &str, w: u32, h: u32, rgb: &[u8]) -> Result<(), Strin
         ImageBuffer::from_raw(w, h, rgb.to_vec()).ok_or("bad rgb buffer")?;
     img.save(path).map_err(|e| e.to_string())
 }
+
+/// Encode an RGB frame to JPEG bytes (for Supabase Storage upload).
+pub fn rgb_to_jpeg_bytes(w: u32, h: u32, rgb: &[u8], quality: u8) -> Result<Vec<u8>, String> {
+    let img: RgbImage =
+        ImageBuffer::from_raw(w, h, rgb.to_vec()).ok_or("bad rgb buffer")?;
+    let mut buf = Vec::new();
+    {
+        let mut cursor = std::io::Cursor::new(&mut buf);
+        let enc = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut cursor, quality);
+        img.write_with_encoder(enc)
+            .map_err(|e| format!("jpeg encode: {e}"))?;
+    }
+    Ok(buf)
+}
 /// Store the current frame as a reference of the empty silo: the picture as
 /// the camera saw it, plus its black-and-white version.
 pub fn save_reference_photo(w: u32, h: u32, rgb: &[u8]) -> Result<PathBuf, String> {

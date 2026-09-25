@@ -1,6 +1,17 @@
 camera:
-  # Ethernet camera on site. USB is not supported.
+  # Ethernet camera / Hikvision NVR. USB is not supported.
   source: "rtsp"
+  # NVR LAN address — app builds rtsp://user:pass@host:port/Streaming/Channels/<id>
+  host: ""
+  rtsp_port: 554
+  username: ""
+  password: ""
+  # Channel 1–16 on the NVR.
+  channel: 1
+  # sub = …02 (preferred), main = …01
+  stream: "sub"
+  # When true, ignore host fields and use rtsp_url as-is.
+  use_custom_url: false
   rtsp_url: ""
   width: 640
   height: 480

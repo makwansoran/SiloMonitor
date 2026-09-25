@@ -1,7 +1,9 @@
-//! Push and pull silo events via Supabase PostgREST (`silo_events`).
+//! Push and pull silo events via Supabase PostgREST (`silo_events`),
+//! and upload live/alert JPEG stills to Storage (`silo-frames`).
 //!
 //! Writes go through a disk-backed outbox so the plant keeps running offline.
 //! Reads (Stats) come from Supabase whenever the table is reachable.
+//! Frame uploads run on a background thread (latest.jpg upsert).
 
 use crate::config::SupabaseCfg;
 use crate::stats::Stats;
@@ -23,6 +25,7 @@ const MISSING_LOG_EVERY: Duration = Duration::from_secs(60);
 const SQL_HINT: &str = "run sql/supabase_silo.sql in the Supabase SQL Editor";
 const SQL_EDITOR: &str =
     "https://supabase.com/dashboard/project/mranicltlsnjurjqwjpv/sql/new";
+const FRAME_BUCKET: &str = "silo-frames";
 
 static PENDING: AtomicUsize = AtomicUsize::new(0);
 static SCHEMA_MISSING: AtomicBool = AtomicBool::new(false);
@@ -138,6 +141,54 @@ impl Supabase {
             labels_empty: Some(stats.labels_empty),
             labels_full: Some(stats.labels_full),
         });
+    }
+
+    /// Upload a JPEG to the `silo-frames` bucket (e.g. `{site}/latest.jpg`).
+    /// Runs on a background thread so the UI never blocks on Storage.
+    pub fn upload_jpeg(&self, object_path: &str, jpeg: Vec<u8>) {
+        if jpeg.is_empty() || object_path.is_empty() {
+            return;
+        }
+        let url = format!(
+            "{}/storage/v1/object/{}/{}",
+            self.base,
+            FRAME_BUCKET,
+            object_path.trim_start_matches('/')
+        );
+        let key = self.key.clone();
+        thread::spawn(move || {
+            match ureq::put(&url)
+                .set("apikey", &key)
+                .set("Authorization", &format!("Bearer {key}"))
+                .set("Content-Type", "image/jpeg")
+                .set("x-upsert", "true")
+                .timeout(Duration::from_secs(20))
+                .send_bytes(&jpeg)
+            {
+                Ok(resp) => {
+                    let status = resp.status();
+                    if !(200..300).contains(&status) {
+                        eprintln!("supabase storage: HTTP {status} for {url}");
+                    }
+                }
+                Err(ureq::Error::Status(code, resp)) => {
+                    let body = resp.into_string().unwrap_or_default();
+                    let snippet: String = body.chars().take(120).collect();
+                    eprintln!("supabase storage: HTTP {code} {snippet}");
+                }
+                Err(e) => eprintln!("supabase storage: {e}"),
+            }
+        });
+    }
+
+    /// Live preview path for this site.
+    pub fn latest_frame_path(&self) -> String {
+        format!("{}/latest.jpg", self.site_id)
+    }
+
+    /// Alert evidence path for this site.
+    pub fn alert_frame_path(&self, unix: u64) -> String {
+        format!("{}/alerts/{unix}.jpg", self.site_id)
     }
 
     /// Pull empty-alert timestamps for this site (newest first, then sorted asc).

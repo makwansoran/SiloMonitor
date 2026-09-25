@@ -73,3 +73,34 @@ begin
 end $$;
 
 notify pgrst, 'reload schema';
+
+-- Live stills for the later cloud app (Pi uploads JPEG snapshots).
+-- Paths: {site_id}/latest.jpg and {site_id}/alerts/{unix}.jpg
+insert into storage.buckets (id, name, public, file_size_limit, allowed_mime_types)
+values (
+  'silo-frames',
+  'silo-frames',
+  false,
+  5242880,
+  array['image/jpeg']
+)
+on conflict (id) do update set
+  file_size_limit = excluded.file_size_limit,
+  allowed_mime_types = excluded.allowed_mime_types;
+
+drop policy if exists "silo frames insert" on storage.objects;
+drop policy if exists "silo frames update" on storage.objects;
+drop policy if exists "silo frames select" on storage.objects;
+
+create policy "silo frames insert" on storage.objects
+  for insert to anon, authenticated
+  with check (bucket_id = 'silo-frames');
+
+create policy "silo frames update" on storage.objects
+  for update to anon, authenticated
+  using (bucket_id = 'silo-frames')
+  with check (bucket_id = 'silo-frames');
+
+create policy "silo frames select" on storage.objects
+  for select to anon, authenticated
+  using (bucket_id = 'silo-frames');

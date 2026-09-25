@@ -125,6 +125,8 @@ struct App {
     last_heartbeat: Option<Instant>,
     evidence_tex: Option<egui::TextureHandle>,
     evidence_path: Option<std::path::PathBuf>,
+    /// Last successful cloud still upload (throttled).
+    last_frame_upload: Option<Instant>,
 }
 
 impl App {
@@ -231,6 +233,7 @@ impl App {
             last_heartbeat: None,
             evidence_tex: None,
             evidence_path: vision::latest_alert_evidence(),
+            last_frame_upload: None,
         }
     }
 
@@ -289,6 +292,7 @@ impl App {
                     }
                 }
                 self.last_rgb = Some((w, h, rgb));
+                self.maybe_upload_live_frame();
             }
             None => self.handle_camera_loss(),
         }
@@ -587,15 +591,92 @@ impl App {
         }
     }
 
-    /// Ethernet camera over RTSP.
+    /// Ethernet camera / Hikvision NVR over RTSP.
     fn config_camera(&mut self, ui: &mut egui::Ui) {
         self.cfg.camera.source = "rtsp".into();
-        ui.label(RichText::new("RTSP URL").size(12.0).color(MUTED));
+
+        ui.label(RichText::new("NVR host").size(12.0).color(MUTED));
         ui.add(
-            egui::TextEdit::singleline(&mut self.cfg.camera.rtsp_url)
+            egui::TextEdit::singleline(&mut self.cfg.camera.host)
                 .desired_width(ui.available_width())
-                .hint_text("rtsp://user:pass@192.168.1.50:554/stream1"),
+                .hint_text("192.168.1.64"),
         );
+
+        ui.add_space(8.0);
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("RTSP port").size(12.0).color(MUTED));
+            let mut port = self.cfg.camera.rtsp_port as f32;
+            ui.add(egui::DragValue::new(&mut port).range(1.0..=65535.0).speed(1));
+            self.cfg.camera.rtsp_port = port as u16;
+        });
+
+        ui.add_space(8.0);
+        ui.label(RichText::new("Username").size(12.0).color(MUTED));
+        ui.add(
+            egui::TextEdit::singleline(&mut self.cfg.camera.username)
+                .desired_width(ui.available_width())
+                .hint_text("viewer"),
+        );
+
+        ui.add_space(8.0);
+        ui.label(RichText::new("Password").size(12.0).color(MUTED));
+        ui.add(
+            egui::TextEdit::singleline(&mut self.cfg.camera.password)
+                .desired_width(ui.available_width())
+                .password(true)
+                .hint_text("••••••••"),
+        );
+
+        ui.add_space(10.0);
+        ui.label(RichText::new("Channel").size(12.0).color(MUTED));
+        ui.horizontal(|ui| {
+            let mut ch = self.cfg.camera.channel as f32;
+            ui.add(egui::Slider::new(&mut ch, 1.0..=16.0).integer().suffix(" / 16"));
+            self.cfg.camera.channel = ch as u8;
+        });
+
+        ui.add_space(8.0);
+        ui.label(RichText::new("Stream").size(12.0).color(MUTED));
+        ui.horizontal(|ui| {
+            let is_sub = !self.cfg.camera.stream.eq_ignore_ascii_case("main");
+            if ui
+                .selectable_label(is_sub, "Sub (preview)")
+                .on_hover_text("Hikvision …02 — preferred for the Pi")
+                .clicked()
+            {
+                self.cfg.camera.stream = "sub".into();
+            }
+            if ui
+                .selectable_label(!is_sub, "Main")
+                .on_hover_text("Hikvision …01 — higher resolution")
+                .clicked()
+            {
+                self.cfg.camera.stream = "main".into();
+            }
+        });
+
+        ui.add_space(10.0);
+        ui.label(RichText::new("Resolved URL").size(12.0).color(MUTED));
+        ui.label(
+            RichText::new(self.cfg.camera.preview_rtsp_url())
+                .size(12.0)
+                .color(TEXT)
+                .monospace(),
+        );
+
+        ui.add_space(10.0);
+        ui.checkbox(
+            &mut self.cfg.camera.use_custom_url,
+            "Use custom RTSP URL",
+        );
+        if self.cfg.camera.use_custom_url {
+            ui.add_space(4.0);
+            ui.add(
+                egui::TextEdit::singleline(&mut self.cfg.camera.rtsp_url)
+                    .desired_width(ui.available_width())
+                    .hint_text("rtsp://user:pass@host:554/Streaming/Channels/102"),
+            );
+        }
 
         ui.add_space(10.0);
         ui.label(RichText::new("Resolution").size(12.0).color(MUTED));
@@ -635,6 +716,11 @@ impl App {
         };
         row_stat(ui, "Camera", status);
         row_stat(ui, "Source", "Ethernet (RTSP)");
+        row_stat(
+            ui,
+            "Channel id",
+            &self.cfg.camera.hikvision_channel_id().to_string(),
+        );
 
         ui.add_space(12.0);
         if pill(ui, "Reconnect camera").clicked() {
@@ -668,18 +754,26 @@ impl App {
                 }
             });
         if ch != self.cfg.radio.channel {
+            let prev_ch = self.cfg.radio.channel;
+            let prev_freq = self.cfg.radio.frequency_mhz.clone();
             self.cfg.radio.channel = ch;
             self.apply_peltor_channel();
-            // RF only changes on the module after UART program — do it now.
-            self.program_sender();
+            // RF only changes after UART program succeeds — otherwise roll back UI.
+            if !self.program_sender() {
+                self.cfg.radio.channel = prev_ch;
+                self.cfg.radio.frequency_mhz = prev_freq.clone();
+                self.radio_freq = prev_freq;
+            }
         }
         ui.add_space(4.0);
         row_stat(ui, "SA828 freq", &self.cfg.radio.frequency_mhz);
         ui.add_space(4.0);
         ui.label(
-            RichText::new("Changing channel programs the SA828 over UART immediately.")
-                .size(11.0)
-                .color(MUTED),
+            RichText::new(
+                "Changing channel programs the SA828 over UART. UI keeps the new channel only if Readback TX/RX matches.",
+            )
+            .size(11.0)
+            .color(MUTED),
         );
         ui.add_space(10.0);
 
@@ -696,7 +790,7 @@ impl App {
                 self.cfg.radio.squelch = new_sq;
             }
             if sq_resp.drag_stopped() {
-                self.program_sender();
+                let _ = self.program_sender();
             }
         }
         ui.add_space(10.0);
@@ -715,7 +809,9 @@ impl App {
                 }
             });
         if self.cfg.radio.ctcss != prev_ctcss {
-            self.program_sender();
+            if !self.program_sender() {
+                self.cfg.radio.ctcss = prev_ctcss;
+            }
         }
         ui.add_space(6.0);
         ui.label(
@@ -889,9 +985,11 @@ impl App {
         }
         ui.add_space(4.0);
         ui.label(
-            RichText::new("Events go to Supabase; Stats reads them back. Offline rows stay queued.")
-                .size(11.0)
-                .color(MUTED),
+            RichText::new(
+                "Events → silo_events. Live stills → Storage silo-frames/{site}/latest.jpg (and alerts/). Offline event rows stay queued.",
+            )
+            .size(11.0)
+            .color(MUTED),
         );
 
         ui.add_space(16.0);
@@ -1147,6 +1245,30 @@ impl App {
         }
     }
 
+    /// Push a JPEG still to Supabase Storage for the later cloud app.
+    /// Throttled to the level check interval (min 15s).
+    fn maybe_upload_live_frame(&mut self) {
+        let Some(cloud) = &self.cloud else {
+            return;
+        };
+        let interval = self.cfg.level.check_interval_seconds.max(15.0);
+        let due = self
+            .last_frame_upload
+            .map(|t| t.elapsed().as_secs_f32() >= interval)
+            .unwrap_or(true);
+        if !due {
+            return;
+        }
+        let Some((w, h, rgb)) = self.last_rgb.as_ref() else {
+            return;
+        };
+        let Ok(jpeg) = vision::rgb_to_jpeg_bytes(*w, *h, rgb, 75) else {
+            return;
+        };
+        cloud.upload_jpeg(&cloud.latest_frame_path(), jpeg);
+        self.last_frame_upload = Some(Instant::now());
+    }
+
     fn term_line(&mut self, line: String) {
         self.term_entry(line, None);
     }
@@ -1254,6 +1376,11 @@ impl App {
             if let Ok(path) =
                 vision::save_alert_evidence(w, h, rgb, roi, unix, score, threshold, self.empty_streak)
             {
+                if let Some(cloud) = &self.cloud {
+                    if let Ok(bytes) = std::fs::read(&path) {
+                        cloud.upload_jpeg(&cloud.alert_frame_path(unix), bytes);
+                    }
+                }
                 self.evidence_path = Some(path);
                 self.evidence_tex = None;
             }
@@ -1597,7 +1724,9 @@ impl App {
         };
     }
 
-    fn program_sender(&mut self) {
+    /// Program SA828 TX/RX to the current channel frequency.
+    /// Returns true only when UART readback confirms the new frequency.
+    fn program_sender(&mut self) -> bool {
         self.apply_peltor_channel();
         let ch = self.cfg.radio.channel;
         match sa828::program(
@@ -1609,11 +1738,11 @@ impl App {
             Ok(msg) => {
                 let _ = self.cfg.save();
                 self.note = format!("Ch {ch} programmed.\n{msg}");
+                true
             }
             Err(e) => {
-                self.note = format!(
-                    "SA828 program failed (Ch {ch} saved in config only): {e}"
-                );
+                self.note = format!("SA828 program failed (Ch {ch} not applied): {e}");
+                false
             }
         }
     }

@@ -19,11 +19,30 @@ pub struct Config {
     pub source_path: Option<PathBuf>,
 }
 
-/// Ethernet camera on the plant network.
+/// Ethernet camera on the plant network (Hikvision NVR or raw RTSP).
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct CameraCfg {
     #[serde(default = "default_cam_source")]
     pub source: String,
+    /// NVR / camera LAN IP or hostname.
+    #[serde(default)]
+    pub host: String,
+    #[serde(default = "default_rtsp_port")]
+    pub rtsp_port: u16,
+    #[serde(default)]
+    pub username: String,
+    #[serde(default)]
+    pub password: String,
+    /// NVR channel 1–16.
+    #[serde(default = "default_nvr_channel")]
+    pub channel: u8,
+    /// `sub` (…02, default) or `main` (…01).
+    #[serde(default = "default_stream")]
+    pub stream: String,
+    /// When true, use [`rtsp_url`] instead of composing a Hikvision URL.
+    #[serde(default)]
+    pub use_custom_url: bool,
+    /// Advanced / legacy full RTSP URL override.
     #[serde(default)]
     pub rtsp_url: String,
     #[serde(default = "default_cam_w")]
@@ -37,6 +56,15 @@ pub struct CameraCfg {
 
 fn default_cam_source() -> String {
     "rtsp".into()
+}
+fn default_rtsp_port() -> u16 {
+    554
+}
+fn default_nvr_channel() -> u8 {
+    1
+}
+fn default_stream() -> String {
+    "sub".into()
 }
 fn default_cam_w() -> u32 {
     640
@@ -52,12 +80,127 @@ impl Default for CameraCfg {
     fn default() -> Self {
         Self {
             source: default_cam_source(),
+            host: String::new(),
+            rtsp_port: default_rtsp_port(),
+            username: String::new(),
+            password: String::new(),
+            channel: default_nvr_channel(),
+            stream: default_stream(),
+            use_custom_url: false,
             rtsp_url: String::new(),
             width: default_cam_w(),
             height: default_cam_h(),
             fps: default_cam_fps(),
         }
     }
+}
+
+impl CameraCfg {
+    /// Hikvision channel id: channel 3 sub → 302, main → 301.
+    pub fn hikvision_channel_id(&self) -> u32 {
+        let ch = self.channel.clamp(1, 16) as u32;
+        let suffix = if self.stream.eq_ignore_ascii_case("main") {
+            1
+        } else {
+            2
+        };
+        ch * 100 + suffix
+    }
+
+    /// URL used by ffmpeg. Custom/legacy `rtsp_url` wins when enabled or when
+    /// host is empty (old configs that only set the full URL).
+    pub fn resolved_rtsp_url(&self) -> Result<String, String> {
+        let custom = self.rtsp_url.trim();
+        if self.use_custom_url {
+            if custom.is_empty() {
+                return Err("Custom RTSP URL is empty".into());
+            }
+            return Ok(custom.to_string());
+        }
+        if self.host.trim().is_empty() {
+            if !custom.is_empty() {
+                return Ok(custom.to_string());
+            }
+            return Err("NVR host is empty — set host or a custom RTSP URL".into());
+        }
+        let user = percent_encode_userinfo(self.username.trim());
+        let pass = percent_encode_userinfo(&self.password);
+        let host = self.host.trim();
+        let port = if self.rtsp_port == 0 {
+            554
+        } else {
+            self.rtsp_port
+        };
+        let id = self.hikvision_channel_id();
+        if user.is_empty() {
+            Ok(format!(
+                "rtsp://{host}:{port}/Streaming/Channels/{id}"
+            ))
+        } else {
+            Ok(format!(
+                "rtsp://{user}:{pass}@{host}:{port}/Streaming/Channels/{id}"
+            ))
+        }
+    }
+
+    /// Composed URL for UI preview (password shown as `***`).
+    pub fn preview_rtsp_url(&self) -> String {
+        if self.use_custom_url {
+            let u = self.rtsp_url.trim();
+            return if u.is_empty() {
+                "(custom URL empty)".into()
+            } else {
+                mask_rtsp_password(u)
+            };
+        }
+        if self.host.trim().is_empty() {
+            if !self.rtsp_url.trim().is_empty() {
+                return mask_rtsp_password(self.rtsp_url.trim());
+            }
+            return "(set NVR host)".into();
+        }
+        let mut preview = self.clone();
+        if !preview.password.is_empty() {
+            preview.password = "***".into();
+        }
+        preview
+            .resolved_rtsp_url()
+            .unwrap_or_else(|_| "(invalid)".into())
+    }
+}
+
+fn percent_encode_userinfo(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                out.push(b as char);
+            }
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
+
+fn mask_rtsp_password(url: &str) -> String {
+    // rtsp://user:pass@host → rtsp://user:***@host
+    let Some(scheme_end) = url.find("://") else {
+        return url.to_string();
+    };
+    let rest = &url[scheme_end + 3..];
+    let Some(at) = rest.find('@') else {
+        return url.to_string();
+    };
+    let creds = &rest[..at];
+    let Some(colon) = creds.find(':') else {
+        return url.to_string();
+    };
+    format!(
+        "{}{}:***{}",
+        &url[..scheme_end + 3],
+        &creds[..colon],
+        &rest[at..]
+    )
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -268,6 +411,13 @@ impl Config {
         doc["radio"] = serde_yaml::to_value(&self.radio).unwrap_or(serde_yaml::Value::Null);
         if let Some(cam) = doc.get_mut("camera") {
             cam["source"] = self.camera.source.clone().into();
+            cam["host"] = self.camera.host.clone().into();
+            cam["rtsp_port"] = (self.camera.rtsp_port as i64).into();
+            cam["username"] = self.camera.username.clone().into();
+            cam["password"] = self.camera.password.clone().into();
+            cam["channel"] = (self.camera.channel as i64).into();
+            cam["stream"] = self.camera.stream.clone().into();
+            cam["use_custom_url"] = serde_yaml::Value::Bool(self.camera.use_custom_url);
             cam["rtsp_url"] = self.camera.rtsp_url.clone().into();
             if let Some(map) = cam.as_mapping_mut() {
                 map.remove(serde_yaml::Value::from("device"));
@@ -295,5 +445,47 @@ impl Config {
         } else {
             PathBuf::from("data").join(p.file_name().unwrap_or_default())
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hikvision_sub_stream_url() {
+        let cam = CameraCfg {
+            host: "192.168.1.64".into(),
+            username: "viewer".into(),
+            password: "secret".into(),
+            channel: 3,
+            stream: "sub".into(),
+            ..CameraCfg::default()
+        };
+        assert_eq!(cam.hikvision_channel_id(), 302);
+        assert_eq!(
+            cam.resolved_rtsp_url().unwrap(),
+            "rtsp://viewer:secret@192.168.1.64:554/Streaming/Channels/302"
+        );
+    }
+
+    #[test]
+    fn custom_url_override() {
+        let cam = CameraCfg {
+            use_custom_url: true,
+            rtsp_url: "rtsp://x/custom".into(),
+            host: "ignored".into(),
+            ..CameraCfg::default()
+        };
+        assert_eq!(cam.resolved_rtsp_url().unwrap(), "rtsp://x/custom");
+    }
+
+    #[test]
+    fn legacy_full_url_when_host_empty() {
+        let cam = CameraCfg {
+            rtsp_url: "rtsp://old@host/path".into(),
+            ..CameraCfg::default()
+        };
+        assert_eq!(cam.resolved_rtsp_url().unwrap(), "rtsp://old@host/path");
     }
 }

@@ -16,11 +16,8 @@ pub struct Cam {
 
 impl Cam {
     pub fn open(cfg: &CameraCfg) -> Result<Self, String> {
-        let url = cfg.rtsp_url.trim();
-        if url.is_empty() {
-            return Err("RTSP URL is empty — set the Ethernet camera address".into());
-        }
-        RtspCam::open(url, cfg.width, cfg.height, cfg.fps).map(|inner| Cam { inner })
+        let url = cfg.resolved_rtsp_url()?;
+        RtspCam::open(&url, cfg.width, cfg.height, cfg.fps).map(|inner| Cam { inner })
     }
 
     pub fn frame(&mut self) -> Option<(u32, u32, Vec<u8>)> {
