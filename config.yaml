@@ -40,6 +40,8 @@ radio:
   uart_port: "/dev/serial0"
   # BCM 23 = header pin 16. Open-drain: LOW keys TX, High-Z when idle.
   ptt_gpio: 23
+  # SA828 SPKEN (pin 9) → e.g. BCM 24 = header pin 18. High=busy, low=free. 0=off.
+  spken_gpio: 0
   audio_device: "plughw:CARD=Headphones,DEV=0"
   # Volume: set on the Pi (alsamixer / desktop). The app does not change PCM.
 supabase:

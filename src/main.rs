@@ -142,6 +142,7 @@ impl App {
             stats.last_train_accuracy = None;
         }
         silo_alert::set_ptt_pin(cfg.radio.ptt_gpio);
+        silo_alert::set_spken_pin(cfg.radio.spken_gpio);
         silo_alert::set_audio_device(&cfg.radio.audio_device);
         silo_alert::set_muted(cfg.radio.muted);
         let mut alert = SiloAlert::new();
@@ -839,6 +840,37 @@ impl App {
                     .suffix("  (0=off; LOW=TX, High-Z idle)"),
             );
             self.cfg.radio.ptt_gpio = ptt as u8;
+            silo_alert::set_ptt_pin(self.cfg.radio.ptt_gpio);
+        }
+        ui.add_space(10.0);
+        {
+            let mut spk = self.cfg.radio.spken_gpio as f32;
+            ui.label(RichText::new("SPKEN GPIO (channel busy)").size(12.0).color(MUTED));
+            ui.add(
+                egui::Slider::new(&mut spk, 0.0..=27.0)
+                    .integer()
+                    .suffix("  (0=off; high=busy)"),
+            );
+            let new_spk = spk as u8;
+            if new_spk != self.cfg.radio.spken_gpio {
+                self.cfg.radio.spken_gpio = new_spk;
+                silo_alert::set_spken_pin(new_spk);
+            }
+            ui.add_space(4.0);
+            let ch_status = match silo_alert::channel_busy() {
+                Some(true) => "BUSY — waiting before TX",
+                Some(false) => "FREE",
+                None => "off / not readable",
+            };
+            row_stat(ui, "Channel", ch_status);
+            ui.add_space(4.0);
+            ui.label(
+                RichText::new(
+                    "Wire SA828 SPKEN (pin 9) → this GPIO. Use 3.3 V module supply or a level shifter.",
+                )
+                .size(11.0)
+                .color(MUTED),
+            );
         }
         ui.add_space(10.0);
         ui.label(RichText::new("Audio device").size(12.0).color(MUTED));
@@ -1758,6 +1790,7 @@ impl App {
         self.apply_peltor_channel();
         self.cfg.radio.ctcss = peltor::clamp_ctcss(self.cfg.radio.ctcss);
         silo_alert::set_ptt_pin(self.cfg.radio.ptt_gpio);
+        silo_alert::set_spken_pin(self.cfg.radio.spken_gpio);
         silo_alert::set_audio_device(&self.cfg.radio.audio_device);
         silo_alert::set_muted(self.cfg.radio.muted);
         match self.cfg.save() {
@@ -3124,6 +3157,7 @@ fn main() -> eframe::Result {
     {
         let cfg = Config::load();
         silo_alert::set_ptt_pin(cfg.radio.ptt_gpio);
+        silo_alert::set_spken_pin(cfg.radio.spken_gpio);
     }
 
     // Headless check of the exact path the Test radio button uses.

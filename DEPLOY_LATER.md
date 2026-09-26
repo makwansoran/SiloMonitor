@@ -85,3 +85,5 @@ While the camera is healthy, the Pi uploads `{site_id}/latest.jpg` to the `silo-
 Set the Peltor LiteCom Pro III headset and SA828 to the **same analog channel** (Config → Radio). If the headset uses a privacy/CTCSS tone, set the same CTCSS in the app before Program module.
 
 **UART TX/RX** (GPIO14/15): only needed to **Program / Read** the module. Voice alerts need **PTT + audio jack → MIC**, not UART.
+
+**Channel busy (optional):** SA828 **SPKEN** (pin 9) → Pi GPIO (Config → Radio → SPKEN GPIO, e.g. BCM 24 / header pin 18). High = busy, low = free. App waits up to 30 s for a clear channel before PTT. Module VCC should be 3.3 V or use a level shifter (Pi GPIO is not 5 V tolerant). `0` = feature off.

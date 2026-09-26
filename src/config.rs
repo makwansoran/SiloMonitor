@@ -260,6 +260,9 @@ pub struct RadioCfg {
     /// BCM pin wired to SA828 PTT (pin 20). 0 = disable GPIO PTT.
     #[serde(default = "default_ptt_gpio")]
     pub ptt_gpio: u8,
+    /// BCM pin wired to SA828 SPKEN (pin 9). High = channel busy. 0 = off.
+    #[serde(default)]
+    pub spken_gpio: u8,
     #[serde(default = "default_audio_device")]
     pub audio_device: String,
     /// Laptop (no GPIO) defaults muted so a bench run never keys a radio.
@@ -282,6 +285,7 @@ impl Default for RadioCfg {
             ctcss: 0,
             uart_port: default_uart_port(),
             ptt_gpio: default_ptt_gpio(),
+            spken_gpio: 0,
             audio_device: default_audio_device(),
             muted: default_muted(),
             volume_test_mode: false,

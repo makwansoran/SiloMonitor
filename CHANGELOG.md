@@ -10,6 +10,7 @@ Every change in this pass. Same product: empty-reference match → confirm → S
 ## Radio
 
 - **sa828-verify** — `src/sa828.rs`, Config Radio. One UART session, blocking write-all + flush; program succeeds only if channel-1 TX/RX readback matches requested freq (±100 Hz). Channel/CTCSS UI rolls back on failure (no fake “saved”).
+- **spken-csma** — `src/silo_alert.rs`, Config Radio. Optional SPKEN GPIO: high=busy, low=free. Wait (debounce + 30s cap) before PTT so alerts do not talk over an occupied channel.
 - **peltor-channels** — `src/peltor.rs`, Config Radio, `src/sa828.rs`, `config.yaml`, `tools/program_sa828.py`. Channel picker for Peltor LiteCom Pro III analog PMR446 Ch 1–16. CTCSS Off + 38 tones (default Off). Program writes matching TX/RX tone to SA828. Digital DMR channels are not used (analog module only).
 - **tx-volume** — Removed. App no longer calls amixer/sox gain. Operator sets Pi system volume only; Test radio / alerts play the WAV as-is.
 - **ptt-once** — Radio TX only on the empty-*confirmed* edge (PTT + WAV once). Sticky latch until vision sees full again. Test radio: PTT LOW → WAV once → High-Z.

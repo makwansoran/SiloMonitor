@@ -5,6 +5,9 @@
 //!   Open-drain: OUTPUT LOW = TX (sink); idle = INPUT High-Z (Bias::Off).
 //!   The Pi must never drive 3.3 V into the SA828 PTT line — the module's
 //!   own pull-up holds idle inactive. Do not use OUTPUT HIGH or pull-up bias.
+//!   SPKEN (SA828 pin 9) -> Pi GPIO (default off; e.g. GPIO24 / header pin 18).
+//!   SPKEN high = channel busy (receiving); low = free. Module VCC must be
+//!   3.3 V or level-shift — Pi GPIO is not 5 V tolerant.
 //!   Audio: Pi 3.5 mm jack -> series pot -> MIC+/MIC-.
 //!   Radio VCC from its own 5 V supply, grounds bonded to the Pi.
 
@@ -22,6 +25,10 @@ const VOLUME_TEST_DIR: &str = "audio/volume_tests";
 const INSTALL_DIR: &str = "/home/spectr/silo-alert";
 /// Never hold the channel longer than this, whatever aplay does.
 const TX_MAX: Duration = Duration::from_secs(20);
+/// Wait this long for SPKEN low before transmitting anyway.
+const CHANNEL_WAIT_MAX: Duration = Duration::from_secs(30);
+/// Require SPKEN low continuously for this long before keying (debounce).
+const CHANNEL_CLEAR_HOLD: Duration = Duration::from_millis(250);
 
 /// Known volume-test clips (filename stem → UI label). Scan order = list order.
 const VOLUME_TEST_CLIPS: &[(&str, &str)] = &[
@@ -34,6 +41,7 @@ const VOLUME_TEST_CLIPS: &[(&str, &str)] = &[
 
 static TX_BUSY: AtomicBool = AtomicBool::new(false);
 static PTT_PIN: AtomicU8 = AtomicU8::new(0);
+static SPKEN_PIN: AtomicU8 = AtomicU8::new(0);
 static MUTED: AtomicBool = AtomicBool::new(false);
 static AUDIO_DEVICE: Mutex<String> = Mutex::new(String::new());
 static STATUS: Mutex<Option<String>> = Mutex::new(None);
@@ -41,6 +49,10 @@ static STATUS: Mutex<Option<String>> = Mutex::new(None);
 pub fn set_ptt_pin(pin: u8) {
     PTT_PIN.store(pin, Ordering::SeqCst);
     ensure_ptt_idle();
+}
+
+pub fn set_spken_pin(pin: u8) {
+    SPKEN_PIN.store(pin, Ordering::SeqCst);
 }
 
 pub fn set_audio_device(dev: &str) {
@@ -51,6 +63,11 @@ pub fn set_audio_device(dev: &str) {
 
 pub fn set_muted(muted: bool) {
     MUTED.store(muted, Ordering::SeqCst);
+}
+
+/// Live channel occupancy from SPKEN. `None` = pin disabled / unreadable.
+pub fn channel_busy() -> Option<bool> {
+    read_spken_busy().ok()
 }
 
 fn audio_device() -> String {
@@ -386,6 +403,8 @@ fn wav_pcm_duration(path: &PathBuf) -> Result<Duration, String> {
 }
 
 fn play_voice_keyed(wav: &PathBuf) -> Result<(), String> {
+    wait_channel_clear()?;
+
     let duration = wav_pcm_duration(wav)?;
     // Unkey 0.5 s before the last sample so TX dies before the clip ends.
     let release_after = duration.saturating_sub(Duration::from_millis(500));
@@ -429,8 +448,54 @@ fn play_voice_keyed(wav: &PathBuf) -> Result<(), String> {
             }
             Err(e) => {
                 drop(ptt.take());
-                return Err(format!("aplay: {e}"));
+                return Err(format!("aplay wait: {e}"));
             }
         }
+    }
+}
+
+/// SPKEN high = receiving / channel busy. Pin 0 = feature off (always free).
+fn read_spken_busy() -> Result<bool, String> {
+    let pin = SPKEN_PIN.load(Ordering::SeqCst);
+    if pin == 0 {
+        return Err("SPKEN disabled".into());
+    }
+    let inp = Gpio::new()
+        .and_then(|gpio| gpio.get(pin))
+        .map(|p| p.into_input())
+        .map_err(|e| format!("SPKEN GPIO{pin}: {e}"))?;
+    Ok(inp.is_high())
+}
+
+/// Block until the channel looks free, or give up after [`CHANNEL_WAIT_MAX`].
+fn wait_channel_clear() -> Result<(), String> {
+    let pin = SPKEN_PIN.load(Ordering::SeqCst);
+    if pin == 0 {
+        return Ok(());
+    }
+    let start = Instant::now();
+    let mut clear_since: Option<Instant> = None;
+    loop {
+        let busy = match read_spken_busy() {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("radio: SPKEN read failed ({e}) — transmitting without CSMA");
+                return Ok(());
+            }
+        };
+        if busy {
+            clear_since = None;
+        } else {
+            match clear_since {
+                None => clear_since = Some(Instant::now()),
+                Some(t) if t.elapsed() >= CHANNEL_CLEAR_HOLD => return Ok(()),
+                Some(_) => {}
+            }
+        }
+        if start.elapsed() >= CHANNEL_WAIT_MAX {
+            eprintln!("radio: channel busy >{}s — transmitting anyway", CHANNEL_WAIT_MAX.as_secs());
+            return Ok(());
+        }
+        thread::sleep(Duration::from_millis(50));
     }
 }
