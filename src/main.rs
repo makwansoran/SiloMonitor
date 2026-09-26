@@ -469,17 +469,10 @@ impl App {
 
     /// When and how strictly the app compares frames to the empty reference.
     fn config_detection(&mut self, ui: &mut egui::Ui) {
-        ui.label(
-            RichText::new(
-                "Every check compares the marked region against the photos of the empty silo.",
-            )
-            .size(13.0)
-            .color(MUTED),
-        );
-        ui.add_space(14.0);
         labeled_slider(
             ui,
             "Check every",
+            "How often a live frame is compared to the empty-silo reference photos.",
             &mut self.cfg.level.check_interval_seconds,
             5.0..=120.0,
             "s",
@@ -487,21 +480,18 @@ impl App {
         labeled_slider(
             ui,
             "State must last",
+            "Empty (before alert) and full again (before radio latch clears) must hold this long.",
             &mut self.cfg.level.empty_confirmation_seconds,
             15.0..=120.0,
             "s",
         );
-        ui.add_space(4.0);
-        ui.label(
-            RichText::new(
-                "Applies both ways: empty before alert, and full again before the radio latch clears.",
-            )
-            .size(11.0)
-            .color(MUTED),
-        );
 
-        ui.add_space(10.0);
-        ui.label(RichText::new("Match threshold").size(12.0).color(MUTED));
+        ui.add_space(4.0);
+        field_label(
+            ui,
+            "Match threshold",
+            "How closely the frame must match empty photos. Auto uses cohesion from your reference set; full samples can raise the effective line.",
+        );
         let base_suggested = self
             .reference
             .as_ref()
@@ -519,38 +509,40 @@ impl App {
         {
             self.cfg.level.empty_match_threshold = pct / 100.0;
         }
-        ui.add_space(4.0);
-        ui.label(
-            RichText::new(format!(
-                "Suggested {:.0}% from empty photos — effective {:.0}% (full samples can raise it).",
-                base_suggested * 100.0,
-                effective * 100.0
-            ))
-            .size(11.0)
-            .color(MUTED),
+        row_stat(
+            ui,
+            "Effective",
+            &format!(
+                "{:.0}% (suggest {:.0}%)",
+                effective * 100.0,
+                base_suggested * 100.0
+            ),
         );
         if let Some(warn) = self.reference.as_ref().and_then(|r| r.cohesion_warning()) {
-            ui.add_space(4.0);
             ui.label(RichText::new(warn).size(11.0).color(RED));
+            ui.add_space(4.0);
         }
         if let Some(warn) = self
             .reference
             .as_ref()
             .and_then(|r| vision::full_sample_warning(r, self.base_match_threshold()))
         {
-            ui.add_space(4.0);
             ui.label(RichText::new(warn).size(11.0).color(RED));
+            ui.add_space(4.0);
         }
         if self.cfg.level.empty_match_threshold > 0.0 {
-            ui.add_space(4.0);
             if quiet_btn(ui, "Auto").clicked() {
                 self.cfg.level.empty_match_threshold = 0.0;
             }
         }
 
-        ui.add_space(14.0);
-        ui.label(RichText::new("Reference").size(12.0).color(MUTED));
-        ui.add_space(8.0);
+        ui.add_space(10.0);
+        field_label(
+            ui,
+            "Reference",
+            "Built from empty-silo photos on Live. Rebuild after changing the watched region.",
+        );
+        ui.add_space(6.0);
         match self.reference.as_ref() {
             Some(r) => {
                 row_stat(ui, "Photos", &r.count().to_string());
@@ -560,8 +552,8 @@ impl App {
                     &format!("{:.0}%", r.cohesion * 100.0),
                 );
                 if let Some(warn) = r.cohesion_warning() {
-                    ui.add_space(4.0);
                     ui.label(RichText::new(warn).size(11.0).color(RED));
+                    ui.add_space(4.0);
                 }
                 row_stat(ui, "Built", &fmt_dt(r.built_at_unix));
                 row_stat(
@@ -596,7 +588,11 @@ impl App {
     fn config_camera(&mut self, ui: &mut egui::Ui) {
         self.cfg.camera.source = "rtsp".into();
 
-        ui.label(RichText::new("NVR host").size(12.0).color(MUTED));
+        field_label(
+            ui,
+            "NVR host",
+            "LAN IP or hostname of the Hikvision NVR (not each camera).",
+        );
         ui.add(
             egui::TextEdit::singleline(&mut self.cfg.camera.host)
                 .desired_width(ui.available_width())
@@ -604,15 +600,15 @@ impl App {
         );
 
         ui.add_space(8.0);
-        ui.horizontal(|ui| {
-            ui.label(RichText::new("RTSP port").size(12.0).color(MUTED));
+        field_label(ui, "RTSP port", "Usually 554. Confirm in the NVR network settings.");
+        {
             let mut port = self.cfg.camera.rtsp_port as f32;
             ui.add(egui::DragValue::new(&mut port).range(1.0..=65535.0).speed(1));
             self.cfg.camera.rtsp_port = port as u16;
-        });
+        }
 
         ui.add_space(8.0);
-        ui.label(RichText::new("Username").size(12.0).color(MUTED));
+        field_label(ui, "Username", "Prefer a view-only NVR user (not admin).");
         ui.add(
             egui::TextEdit::singleline(&mut self.cfg.camera.username)
                 .desired_width(ui.available_width())
@@ -620,7 +616,7 @@ impl App {
         );
 
         ui.add_space(8.0);
-        ui.label(RichText::new("Password").size(12.0).color(MUTED));
+        field_label(ui, "Password", "Stored only in local config on this Pi — not committed to git.");
         ui.add(
             egui::TextEdit::singleline(&mut self.cfg.camera.password)
                 .desired_width(ui.available_width())
@@ -629,7 +625,11 @@ impl App {
         );
 
         ui.add_space(10.0);
-        ui.label(RichText::new("Channel").size(12.0).color(MUTED));
+        field_label(
+            ui,
+            "Channel",
+            "NVR camera number 1–16 for the silo. Sub-stream ID = channel×100+2 (e.g. 3 → 302).",
+        );
         ui.horizontal(|ui| {
             let mut ch = self.cfg.camera.channel as f32;
             ui.add(egui::Slider::new(&mut ch, 1.0..=16.0).integer().suffix(" / 16"));
@@ -637,27 +637,27 @@ impl App {
         });
 
         ui.add_space(8.0);
-        ui.label(RichText::new("Stream").size(12.0).color(MUTED));
+        field_label(
+            ui,
+            "Stream",
+            "Sub (…02) is low-res — preferred on the Pi. Main (…01) is high-res.",
+        );
         ui.horizontal(|ui| {
             let is_sub = !self.cfg.camera.stream.eq_ignore_ascii_case("main");
-            if ui
-                .selectable_label(is_sub, "Sub (preview)")
-                .on_hover_text("Hikvision …02 — preferred for the Pi")
-                .clicked()
-            {
+            if ui.selectable_label(is_sub, "Sub").clicked() {
                 self.cfg.camera.stream = "sub".into();
             }
-            if ui
-                .selectable_label(!is_sub, "Main")
-                .on_hover_text("Hikvision …01 — higher resolution")
-                .clicked()
-            {
+            if ui.selectable_label(!is_sub, "Main").clicked() {
                 self.cfg.camera.stream = "main".into();
             }
         });
 
         ui.add_space(10.0);
-        ui.label(RichText::new("Resolved URL").size(12.0).color(MUTED));
+        field_label(
+            ui,
+            "Resolved URL",
+            "URL ffmpeg will open. Password shown as ***.",
+        );
         ui.label(
             RichText::new(self.cfg.camera.preview_rtsp_url())
                 .size(12.0)
@@ -666,10 +666,8 @@ impl App {
         );
 
         ui.add_space(10.0);
-        ui.checkbox(
-            &mut self.cfg.camera.use_custom_url,
-            "Use custom RTSP URL",
-        );
+        ui.checkbox(&mut self.cfg.camera.use_custom_url, "Use custom RTSP URL")
+            .on_hover_text("Override Hikvision URL builder with a full rtsp:// address.");
         if self.cfg.camera.use_custom_url {
             ui.add_space(4.0);
             ui.add(
@@ -680,7 +678,11 @@ impl App {
         }
 
         ui.add_space(10.0);
-        ui.label(RichText::new("Resolution").size(12.0).color(MUTED));
+        field_label(
+            ui,
+            "Resolution",
+            "Decode size after ffmpeg scale. Keep modest for Pi CPU.",
+        );
         ui.horizontal(|ui| {
             let mut w = self.cfg.camera.width as f32;
             let mut h = self.cfg.camera.height as f32;
@@ -693,19 +695,17 @@ impl App {
 
         ui.add_space(10.0);
         let mut fps = self.cfg.camera.fps as f32;
-        ui.label(RichText::new("Decode rate").size(12.0).color(MUTED));
+        field_label(
+            ui,
+            "Decode rate",
+            "Frames per second from ffmpeg. Low is fine — detection only runs each check interval.",
+        );
         ui.add(egui::Slider::new(&mut fps, 1.0..=15.0).integer().suffix(" fps"));
         self.cfg.camera.fps = fps as u32;
-        ui.add_space(4.0);
-        ui.label(
-            RichText::new("Low is fine — the model only looks each check interval.")
-                .size(11.0)
-                .color(MUTED),
-        );
 
         ui.add_space(14.0);
-        ui.label(RichText::new("Status").size(12.0).color(MUTED));
-        ui.add_space(8.0);
+        field_label(ui, "Status", "Live connection state for the Ethernet/RTSP camera.");
+        ui.add_space(6.0);
         let status = if self.cam.is_none() {
             "Not connected"
         } else if self.cam_down_since.is_some() {
@@ -724,27 +724,27 @@ impl App {
         );
 
         ui.add_space(12.0);
-        if pill(ui, "Reconnect camera").clicked() {
+        if pill(ui, "Reconnect camera")
+            .on_hover_text("Restart ffmpeg against the current host / URL settings.")
+            .clicked()
+        {
             self.reconnect_camera();
         }
     }
 
     /// SA828 intercom settings matched to the Peltor LiteCom Pro III headset.
     fn config_radio(&mut self, ui: &mut egui::Ui) {
-        ui.label(
-            RichText::new("Peltor LiteCom Pro III — analog PMR446")
-                .size(12.0)
-                .color(MUTED),
-        );
-        ui.add_space(10.0);
-
         // Sync channel from stored frequency if needed.
         self.cfg.radio.channel = peltor::clamp_channel(self.cfg.radio.channel);
         if self.cfg.radio.channel == 0 {
             self.cfg.radio.channel = peltor::channel_for_freq(&self.cfg.radio.frequency_mhz);
         }
 
-        ui.label(RichText::new("Channel").size(12.0).color(MUTED));
+        field_label(
+            ui,
+            "Channel",
+            "Peltor analog PMR446 channel 1–16. Programs the SA828 over UART; kept only if TX/RX readback matches. Digital DMR on the headset is not used.",
+        );
         let mut ch = self.cfg.radio.channel;
         egui::ComboBox::from_id_salt("peltor_channel")
             .width(ui.available_width())
@@ -759,7 +759,6 @@ impl App {
             let prev_freq = self.cfg.radio.frequency_mhz.clone();
             self.cfg.radio.channel = ch;
             self.apply_peltor_channel();
-            // RF only changes after UART program succeeds — otherwise roll back UI.
             if !self.program_sender() {
                 self.cfg.radio.channel = prev_ch;
                 self.cfg.radio.frequency_mhz = prev_freq.clone();
@@ -768,24 +767,16 @@ impl App {
         }
         ui.add_space(4.0);
         row_stat(ui, "SA828 freq", &self.cfg.radio.frequency_mhz);
-        ui.add_space(4.0);
-        ui.label(
-            RichText::new(
-                "Changing channel programs the SA828 over UART. UI keeps the new channel only if Readback TX/RX matches.",
-            )
-            .size(11.0)
-            .color(MUTED),
-        );
         ui.add_space(10.0);
 
         {
             let mut sq = self.cfg.radio.squelch as f32;
-            ui.label(RichText::new("Squelch").size(12.0).color(MUTED));
-            let sq_resp = ui.add(
-                egui::Slider::new(&mut sq, 0.0..=8.0)
-                    .integer()
-                    .suffix("  (0=open hiss, 1=normal)"),
+            field_label(
+                ui,
+                "Squelch",
+                "0 = open (hiss). 1 = normal. Higher = quieter until a strong signal.",
             );
+            let sq_resp = ui.add(egui::Slider::new(&mut sq, 0.0..=8.0).integer());
             let new_sq = sq as u8;
             if new_sq != self.cfg.radio.squelch {
                 self.cfg.radio.squelch = new_sq;
@@ -798,7 +789,11 @@ impl App {
 
         self.cfg.radio.ctcss = peltor::clamp_ctcss(self.cfg.radio.ctcss);
         let prev_ctcss = self.cfg.radio.ctcss;
-        ui.label(RichText::new("CTCSS").size(12.0).color(MUTED));
+        field_label(
+            ui,
+            "CTCSS",
+            "Privacy tone. Must match the headset if it uses CTCSS. Off = 0.",
+        );
         egui::ComboBox::from_id_salt("peltor_ctcss")
             .width(ui.available_width())
             .selected_text(peltor::ctcss_label(self.cfg.radio.ctcss))
@@ -814,17 +809,13 @@ impl App {
                 self.cfg.radio.ctcss = prev_ctcss;
             }
         }
-        ui.add_space(6.0);
-        ui.label(
-            RichText::new(
-                "Digital DMR channels on the headset are not used — SA828 is analog only.",
-            )
-            .size(11.0)
-            .color(MUTED),
-        );
 
         ui.add_space(10.0);
-        ui.label(RichText::new("UART port").size(12.0).color(MUTED));
+        field_label(
+            ui,
+            "UART port",
+            "Serial device for Program / Read (usually /dev/serial0 on Pi GPIO14/15).",
+        );
         ui.add(
             egui::TextEdit::singleline(&mut self.cfg.radio.uart_port)
                 .desired_width(ui.available_width())
@@ -833,24 +824,24 @@ impl App {
         ui.add_space(10.0);
         {
             let mut ptt = self.cfg.radio.ptt_gpio as f32;
-            ui.label(RichText::new("PTT GPIO").size(12.0).color(MUTED));
-            ui.add(
-                egui::Slider::new(&mut ptt, 0.0..=27.0)
-                    .integer()
-                    .suffix("  (0=off; LOW=TX, High-Z idle)"),
+            field_label(
+                ui,
+                "PTT GPIO",
+                "BCM pin to SA828 PTT (pin 20). 0 = off. LOW = TX, idle = High-Z (never drive 3.3 V).",
             );
+            ui.add(egui::Slider::new(&mut ptt, 0.0..=27.0).integer());
             self.cfg.radio.ptt_gpio = ptt as u8;
             silo_alert::set_ptt_pin(self.cfg.radio.ptt_gpio);
         }
         ui.add_space(10.0);
         {
             let mut spk = self.cfg.radio.spken_gpio as f32;
-            ui.label(RichText::new("SPKEN GPIO (channel busy)").size(12.0).color(MUTED));
-            ui.add(
-                egui::Slider::new(&mut spk, 0.0..=27.0)
-                    .integer()
-                    .suffix("  (0=off; high=busy)"),
+            field_label(
+                ui,
+                "SPKEN GPIO",
+                "Optional. SA828 SPKEN (pin 9) → this BCM pin. High = channel busy; waits before TX. 0 = off. Use 3.3 V module supply or a level shifter.",
             );
+            ui.add(egui::Slider::new(&mut spk, 0.0..=27.0).integer());
             let new_spk = spk as u8;
             if new_spk != self.cfg.radio.spken_gpio {
                 self.cfg.radio.spken_gpio = new_spk;
@@ -858,36 +849,27 @@ impl App {
             }
             ui.add_space(4.0);
             let ch_status = match silo_alert::channel_busy() {
-                Some(true) => "BUSY — waiting before TX",
+                Some(true) => "BUSY",
                 Some(false) => "FREE",
-                None => "off / not readable",
+                None => "off",
             };
             row_stat(ui, "Channel", ch_status);
-            ui.add_space(4.0);
-            ui.label(
-                RichText::new(
-                    "Wire SA828 SPKEN (pin 9) → this GPIO. Use 3.3 V module supply or a level shifter.",
-                )
-                .size(11.0)
-                .color(MUTED),
-            );
         }
         ui.add_space(10.0);
-        ui.label(RichText::new("Audio device").size(12.0).color(MUTED));
+        field_label(
+            ui,
+            "Audio device",
+            "ALSA device for the voice clip (3.5 mm → MIC). Volume is set on the Pi system, not by the app.",
+        );
         ui.add(
             egui::TextEdit::singleline(&mut self.cfg.radio.audio_device)
                 .desired_width(ui.available_width())
                 .hint_text("plughw:CARD=Headphones,DEV=0"),
         );
-        ui.add_space(4.0);
-        ui.label(
-            RichText::new("Volume is the Pi system volume — the app does not change it.")
-                .size(11.0)
-                .color(MUTED),
-        );
         ui.add_space(10.0);
         if ui
             .checkbox(&mut self.cfg.radio.muted, "Mute radio")
+            .on_hover_text("Skip PTT + voice on empty alerts (Test radio still works).")
             .changed()
         {
             silo_alert::set_muted(self.cfg.radio.muted);
@@ -897,7 +879,8 @@ impl App {
         ui.checkbox(
             &mut self.cfg.radio.volume_test_mode,
             "Volume test sounds",
-        );
+        )
+        .on_hover_text("Test radio plays a clip from audio/volume_tests/ instead of the production WAV.");
         if self.cfg.radio.volume_test_mode {
             ui.add_space(4.0);
             let clips = silo_alert::volume_test_files();
@@ -919,7 +902,11 @@ impl App {
                     .find(|(f, _)| f == &current)
                     .map(|(_, l)| l.as_str())
                     .unwrap_or(current.as_str());
-                ui.label(RichText::new("Test clip").size(12.0).color(MUTED));
+                field_label(
+                    ui,
+                    "Test clip",
+                    "Only used by Test radio. Empty alerts still use the normal production clip.",
+                );
                 egui::ComboBox::from_id_salt("volume_test_clip")
                     .width(ui.available_width())
                     .selected_text(current_label)
@@ -932,12 +919,6 @@ impl App {
                             );
                         }
                     });
-                ui.add_space(4.0);
-                ui.label(
-                    RichText::new("Only used by Test radio — empty alerts still use the normal clip.")
-                        .size(11.0)
-                        .color(MUTED),
-                );
             }
         }
 
@@ -954,32 +935,30 @@ impl App {
         );
 
         ui.add_space(12.0);
-        if pill(ui, "Program module").clicked() {
+        if pill(ui, "Program module")
+            .on_hover_text(
+                "Write the selected channel frequency to all 16 SA828 memories. Also runs when you change Channel / CTCSS / Squelch.",
+            )
+            .clicked()
+        {
             self.program_sender();
         }
-        ui.add_space(4.0);
-        ui.label(
-            RichText::new(
-                "Program writes the selected channel frequency to all 16 SA828 memories. Also runs automatically when you change Channel / CTCSS / Squelch.",
-            )
-            .size(11.0)
-            .color(MUTED),
-        );
         ui.add_space(8.0);
-        if pill(ui, "Read module").clicked() {
+        if pill(ui, "Read module")
+            .on_hover_text("Read current TX/RX frequency from the SA828 over UART.")
+            .clicked()
+        {
             self.read_radio();
         }
         ui.add_space(8.0);
-        if pill(ui, "Test radio").clicked() {
+        let test_tip = if self.cfg.radio.volume_test_mode {
+            "PTT LOW → play selected volume-test WAV → High-Z idle."
+        } else {
+            "PTT LOW → play production WAV once → High-Z idle."
+        };
+        if pill(ui, "Test radio").on_hover_text(test_tip).clicked() {
             self.test_radio();
         }
-        ui.add_space(4.0);
-        let test_hint = if self.cfg.radio.volume_test_mode {
-            "Test radio: PTT LOW → play selected volume-test WAV → High-Z idle."
-        } else {
-            "Test radio: PTT LOW → play WAV once → High-Z idle."
-        };
-        ui.label(RichText::new(test_hint).size(11.0).color(MUTED));
     }
 
     fn apply_peltor_channel(&mut self) {
@@ -992,7 +971,11 @@ impl App {
 
     /// Site identity, cloud sync and storage.
     fn config_app(&mut self, ui: &mut egui::Ui) {
-        ui.label(RichText::new("Site ID").size(12.0).color(MUTED));
+        field_label(
+            ui,
+            "Site ID",
+            "Identity for Supabase events and stills (e.g. spectr-pi).",
+        );
         ui.add(
             egui::TextEdit::singleline(&mut self.cfg.supabase.site_id)
                 .desired_width(ui.available_width())
@@ -1000,7 +983,10 @@ impl App {
         );
         ui.add_space(12.0);
 
-        ui.checkbox(&mut self.cfg.supabase.enabled, "Send events to Supabase");
+        ui.checkbox(&mut self.cfg.supabase.enabled, "Send events to Supabase")
+            .on_hover_text(
+                "Events → silo_events. Live stills → Storage silo-frames/{site}/latest.jpg. Offline rows stay queued.",
+            );
         ui.add_space(10.0);
         row_stat(ui, "Cloud", &cloud_status(self.cloud.is_some()));
         row_stat(ui, "Queued", &supabase::pending().to_string());
@@ -1015,18 +1001,10 @@ impl App {
             ui.add_space(8.0);
             ui.label(RichText::new(err).size(11.0).color(RED));
         }
-        ui.add_space(4.0);
-        ui.label(
-            RichText::new(
-                "Events → silo_events. Live stills → Storage silo-frames/{site}/latest.jpg (and alerts/). Offline event rows stay queued.",
-            )
-            .size(11.0)
-            .color(MUTED),
-        );
 
         ui.add_space(16.0);
-        ui.label(RichText::new("Monitoring").size(12.0).color(MUTED));
-        ui.add_space(8.0);
+        field_label(ui, "Monitoring", "Counters for this running session.");
+        ui.add_space(6.0);
         row_stat(ui, "Checks", &self.stats.checks.to_string());
         row_stat(ui, "Empty hits", &self.stats.empty_hits.to_string());
         row_stat(
@@ -1041,8 +1019,8 @@ impl App {
         );
 
         ui.add_space(16.0);
-        ui.label(RichText::new("Storage").size(12.0).color(MUTED));
-        ui.add_space(8.0);
+        field_label(ui, "Storage", "Local log path and number of reference images on disk.");
+        ui.add_space(6.0);
         row_stat(ui, "Log", &self.log_path.display().to_string());
         row_stat(ui, "Images", &self.samples.len().to_string());
         ui.add_space(10.0);
@@ -2962,6 +2940,18 @@ fn row_stat(ui: &mut egui::Ui, k: &str, v: &str) {
     ui.add_space(6.0);
 }
 
+/// Field header with an optional `!` tip (hover for description).
+fn field_label(ui: &mut egui::Ui, label: &str, tip: &str) {
+    ui.horizontal(|ui| {
+        ui.label(RichText::new(label).size(12.0).color(MUTED));
+        if !tip.is_empty() {
+            ui.add_space(2.0);
+            ui.label(RichText::new("!").size(11.0).color(BLUE).strong())
+                .on_hover_text(tip);
+        }
+    });
+}
+
 fn note_line(ui: &mut egui::Ui, note: &str) {
     if !note.is_empty() {
         ui.label(RichText::new(note).size(12.0).color(MUTED));
@@ -3012,8 +3002,15 @@ fn friendly_io_note(err: &str) -> String {
     }
 }
 
-fn labeled_slider(ui: &mut egui::Ui, label: &str, value: &mut f32, range: std::ops::RangeInclusive<f32>, unit: &str) {
-    ui.label(RichText::new(label).size(12.0).color(MUTED));
+fn labeled_slider(
+    ui: &mut egui::Ui,
+    label: &str,
+    tip: &str,
+    value: &mut f32,
+    range: std::ops::RangeInclusive<f32>,
+    unit: &str,
+) {
+    field_label(ui, label, tip);
     ui.add(egui::Slider::new(value, range).suffix(format!(" {unit}")));
     ui.add_space(6.0);
 }
