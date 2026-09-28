@@ -3,6 +3,11 @@
 **/*.rs.bk
 .tmp/
 
+# Secrets — never commit
+.env
+.env.local
+.env.*.local
+
 # Runtime (camera refs, outbox, logs — local only)
 /data/
 
@@ -12,7 +17,4 @@
 .idea/
 .vscode/
 *.iml
-
-# Keep .env in this private repo so Pi/laptop deploy has keys.
-# Rotate the key if the repo is ever made public.
 *.pem
