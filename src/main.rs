@@ -123,6 +123,12 @@ struct App {
     empty_streak: u32,
     radio_fault: bool,
     last_heartbeat: Option<Instant>,
+    last_log_purge: Option<Instant>,
+    /// Last `vcgencmd get_throttled` value. 0 means 5 V has held since boot.
+    last_throttled: Option<u32>,
+    last_power_daily: Option<Instant>,
+    /// Last sparse "silo is full" cloud row.
+    last_full_note: Option<Instant>,
     evidence_tex: Option<egui::TextureHandle>,
     evidence_path: Option<std::path::PathBuf>,
 }
@@ -230,6 +236,10 @@ impl App {
             empty_streak: 0,
             radio_fault,
             last_heartbeat: None,
+            last_log_purge: None,
+            last_throttled: read_throttled(),
+            last_power_daily: None,
+            last_full_note: None,
             evidence_tex: None,
             evidence_path: vision::latest_alert_evidence(),
         }
@@ -254,10 +264,17 @@ impl App {
         self.logo_tex = Some(ctx.load_texture("spectr_mark", color, Default::default()));
     }
 
-    /// Grab a frame, healing the camera if it dropped out, then run the
-    /// scheduled check. Runs on every page — monitoring never pauses because
-    /// an operator opened Train or Config.
-    fn pull_frame(&mut self, ctx: &egui::Context) {
+    /// Camera, check, radio and cloud. No window required.
+    fn tick_plant(&mut self) {
+        pet_watchdog();
+        self.take_radio_status();
+        self.pull_frame(None);
+        self.tick_heartbeat();
+        self.maybe_daily_power();
+    }
+    /// Grab a frame and run the scheduled check. The picture is optional;
+    /// headless mode passes no context and still compares and alerts.
+    fn pull_frame(&mut self, ctx: Option<&egui::Context>) {
         match self.cam.as_mut().and_then(|c| c.frame()) {
             Some((w, h, rgb)) => {
                 if self.cam_down_since.is_some() {
@@ -281,12 +298,14 @@ impl App {
                 self.cam_retry_at = None;
                 self.warned_cam_open = false;
 
-                let img = egui::ColorImage::from_rgb([w as usize, h as usize], &rgb);
-                match &mut self.live_tex {
-                    Some(t) => t.set(img, Default::default()),
-                    None => {
-                        self.live_tex =
-                            Some(ctx.load_texture("live", img, Default::default()))
+                if let Some(ctx) = ctx {
+                    let img = egui::ColorImage::from_rgb([w as usize, h as usize], &rgb);
+                    match &mut self.live_tex {
+                        Some(t) => t.set(img, Default::default()),
+                        None => {
+                            self.live_tex =
+                                Some(ctx.load_texture("live", img, Default::default()))
+                        }
                     }
                 }
                 self.last_rgb = Some((w, h, rgb));
@@ -1376,16 +1395,22 @@ impl App {
             if let Some(alert) = &mut self.alert {
                 alert.on_filled();
             }
+            if let Some(cloud) = &self.cloud {
+                cloud.push_event("full", Some(false), Some(score));
+            }
         }
 
         if !just_confirmed {
             self.store_compared_frame(w, h, rgb, None);
         }
 
-        let kind = if looks_empty { "empty" } else { "full" };
-        if let Some(cloud) = &self.cloud {
-            cloud.push_event("check", Some(looks_empty), Some(score));
+        if just_filled {
+            self.last_full_note = Some(Instant::now());
+        } else if !looks_empty {
+            self.note_full_day();
         }
+
+        let kind = if looks_empty { "empty" } else { "full" };
         let cooldown = looks_empty && self.empty && !alerted;
         let conf = self
             .confidence()
@@ -1915,6 +1940,21 @@ impl App {
         if let Some(cloud) = &self.cloud {
             cloud.push_heartbeat(&self.stats);
         }
+        self.purge_old_logs();
+    }
+
+    fn purge_old_logs(&mut self) {
+        let due = self
+            .last_log_purge
+            .map(|t| t.elapsed() >= Duration::from_secs(24 * 60 * 60))
+            .unwrap_or(true);
+        if !due {
+            return;
+        }
+        self.last_log_purge = Some(Instant::now());
+        if let Some(cloud) = &self.cloud {
+            cloud.purge_expired_logs();
+        }
     }
 
     fn take_radio_status(&mut self) {
@@ -1935,6 +1975,52 @@ impl App {
             } else {
                 cloud.push_event("radio_fail", Some(self.empty), None);
             }
+        }
+        self.report_power();
+    }
+
+    /// Read the Pi throttled register and store it in Supabase as kind `power`.
+    fn report_power(&mut self) {
+        let Some(bits) = read_throttled() else {
+            return;
+        };
+        self.last_throttled = Some(bits);
+        if let Some(cloud) = &self.cloud {
+            cloud.push_power(bits);
+        }
+        if bits != 0 {
+            self.term_line(Self::term_now(&format!("power  throttled 0x{bits:x}")));
+        }
+    }
+
+    fn maybe_daily_power(&mut self) {
+        let due = self
+            .last_power_daily
+            .map(|t| t.elapsed() >= Duration::from_secs(24 * 60 * 60))
+            .unwrap_or(true);
+        if !due {
+            return;
+        }
+        self.last_power_daily = Some(Instant::now());
+        self.report_power();
+    }
+
+    /// One row a day while the silo is full, so the day has a timestamp
+    /// without a row for every check.
+    fn note_full_day(&mut self) {
+        if !self.armed || !self.monitor || self.empty || self.cam_down_since.is_some() {
+            return;
+        }
+        let due = self
+            .last_full_note
+            .map(|t| t.elapsed() >= Duration::from_secs(24 * 60 * 60))
+            .unwrap_or(true);
+        if !due {
+            return;
+        }
+        self.last_full_note = Some(Instant::now());
+        if let Some(cloud) = &self.cloud {
+            cloud.push_event("full", Some(false), self.last_match);
         }
     }
 
@@ -2324,15 +2410,17 @@ impl PlantState {
 
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        pet_watchdog();
         style(ctx);
         self.ensure_logo(ctx);
         self.take_radio_status();
         if self.dataset_dirty {
             self.refresh_samples();
         }
-        self.pull_frame(ctx);
+        self.pull_frame(Some(ctx));
         self.sync_model_view(ctx);
         self.tick_heartbeat();
+        self.maybe_daily_power();
         if self.page == Page::Model && self.sample_idx.is_some() {
             self.sync_sample_tex(ctx);
         }
@@ -2418,6 +2506,20 @@ impl eframe::App for App {
                             )
                             .size(14.0)
                             .color(MUTED),
+                        );
+                        ui.add_space(4.0);
+                        let power = self
+                            .last_throttled
+                            .map(|b| format!("0x{b:x}"))
+                            .unwrap_or_else(|| "—".into());
+                        let power_color = match self.last_throttled {
+                            Some(0) | None => MUTED,
+                            Some(_) => RED,
+                        };
+                        ui.label(
+                            RichText::new(format!("Power  {power}"))
+                                .size(13.0)
+                                .color(power_color),
                         );
 
                         if let Some(step) = self.wizard_step() {
@@ -3177,8 +3279,67 @@ fn line_chart(ui: &mut egui::Ui, values: &[u32], bucket_secs: u64) {
     }
 }
 
+/// Tell systemd the plant loop is still running. No-op outside the service.
+fn read_throttled() -> Option<u32> {
+    let output = std::process::Command::new("vcgencmd")
+        .arg("get_throttled")
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    let hex = text.split('=').nth(1)?.trim().trim_start_matches("0x");
+    u32::from_str_radix(hex, 16).ok()
+}
+
+fn pet_watchdog() {
+    use std::sync::Mutex;
+    static LAST: Mutex<Option<Instant>> = Mutex::new(None);
+    let Ok(mut last) = LAST.lock() else {
+        return;
+    };
+    let due = last
+        .map(|t| t.elapsed() >= Duration::from_secs(10))
+        .unwrap_or(true);
+    if !due {
+        return;
+    }
+    *last = Some(Instant::now());
+    sd_notify("WATCHDOG=1");
+}
+
+fn sd_notify(state: &str) {
+    let Ok(addr) = std::env::var("NOTIFY_SOCKET") else {
+        return;
+    };
+    if addr.is_empty() {
+        return;
+    }
+    use std::os::linux::net::SocketAddrExt;
+    use std::os::unix::net::{SocketAddr, UnixDatagram};
+    let Ok(sock) = UnixDatagram::unbound() else {
+        return;
+    };
+    let dest = if let Some(name) = addr.strip_prefix('@') {
+        let Ok(sa) = SocketAddr::from_abstract_name(name.as_bytes()) else {
+            return;
+        };
+        sa
+    } else {
+        let Ok(sa) = SocketAddr::from_pathname(&addr) else {
+            return;
+        };
+        sa
+    };
+    let _ = sock.send_to_addr(state.as_bytes(), &dest);
+}
+
 fn main() -> eframe::Result {
     load_dotenv();
+    // First ping before camera and cloud setup, so a slow start still
+    // fits inside WatchdogSec.
+    sd_notify("WATCHDOG=1");
     if std::env::var_os("WINIT_UNIX_BACKEND").is_none() {
         unsafe { std::env::set_var("WINIT_UNIX_BACKEND", "x11") };
     }
@@ -3204,16 +3365,6 @@ fn main() -> eframe::Result {
         }
     }
 
-    let cam = match camera::Cam::open(&Config::load().camera) {
-        Ok(c) => Some(c),
-        Err(e) => {
-            // Keep running: the supervisor retries, and Train still works.
-            eprintln!("camera open failed (will keep retrying): {e}");
-            None
-        }
-    };
-    eprintln!("opening Industrial Smart System");
-
     let opts = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1180.0, 720.0])
@@ -3222,11 +3373,58 @@ fn main() -> eframe::Result {
         ..Default::default()
     };
 
-    eframe::run_native(
-        "Industrial Smart System",
-        opts,
-        Box::new(move |_cc| Ok(Box::new(App::new(cam)))),
-    )
+    loop {
+        sd_notify("WATCHDOG=1");
+        if display_ready() {
+            let started = Instant::now();
+            let cam = match camera::Cam::open(&Config::load().camera) {
+                Ok(c) => Some(c),
+                Err(e) => {
+                    eprintln!("camera open failed (will keep retrying): {e}");
+                    None
+                }
+            };
+            eprintln!("opening Industrial Smart System");
+            match eframe::run_native(
+                "Industrial Smart System",
+                opts.clone(),
+                Box::new(move |_cc| Ok(Box::new(App::new(cam)))),
+            ) {
+                Ok(()) => eprintln!("gui closed — plant keeps running"),
+                Err(e) => eprintln!("gui failed — plant keeps running: {e}"),
+            }
+            if started.elapsed() < Duration::from_secs(3) {
+                std::thread::sleep(Duration::from_secs(3));
+            }
+        }
+        run_headless_until_display();
+    }
+}
+
+/// True when an X server socket is present for `$DISPLAY`.
+fn display_ready() -> bool {
+    let display = std::env::var("DISPLAY").unwrap_or_else(|_| ":0".into());
+    let n = display
+        .trim_start_matches(':')
+        .chars()
+        .next()
+        .filter(|c| c.is_ascii_digit())
+        .unwrap_or('0');
+    std::path::Path::new(&format!("/tmp/.X11-unix/X{n}")).exists()
+}
+
+/// Camera, comparison and radio with no window. Returns when the desktop is back.
+fn run_headless_until_display() {
+    eprintln!("plant: desktop is down — monitoring continues");
+    let mut app = App::new(None);
+    loop {
+        if display_ready() {
+            eprintln!("plant: desktop is back");
+            return;
+        }
+        app.tick_plant();
+        std::thread::sleep(Duration::from_millis(200));
+    }
 }
 
 /// Load KEY=VALUE lines from .env next to the binary / cwd. Does not override existing env.

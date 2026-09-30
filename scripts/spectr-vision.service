@@ -1,8 +1,8 @@
 [Unit]
 Description=Industrial Smart System — silo empty monitoring
-# Ethernet camera + desktop session. Do not wait for USB video0.
-After=graphical.target network-online.target
-Wants=graphical.target network-online.target
+# The plant loop does not need the desktop. X11 is only the operator window.
+After=network-online.target
+Wants=network-online.target
 
 [Service]
 Type=simple
@@ -13,7 +13,7 @@ Environment=DISPLAY=:0
 Environment=XDG_RUNTIME_DIR=/run/user/1000
 Environment=WINIT_UNIX_BACKEND=x11
 
-# Keep the panel awake: a blanked screen hides the operator UI.
+# Keep the panel awake when a desktop exists. Failure is fine headless.
 ExecStartPre=-/usr/bin/xset -display :0 s off
 ExecStartPre=-/usr/bin/xset -display :0 s noblank
 ExecStartPre=-/usr/bin/xset -display :0 -dpms
@@ -27,8 +27,15 @@ Restart=always
 RestartSec=3
 StartLimitIntervalSec=0
 
-StandardOutput=append:/home/spectr/silo-alert/data/service.log
-StandardError=append:/home/spectr/silo-alert/data/service.log
+# Watchdog: the plant loop must ping every few seconds. A hung loop stops
+# pinging, systemd kills the process, and Restart= brings it back.
+WatchdogSec=45
+NotifyAccess=main
+
+# Crash lines stay in the journal, which rotates. The plant log is the
+# compact rows in Supabase, deleted after 30 days. Do not grow a file on the SD card.
+StandardOutput=journal
+StandardError=journal
 
 [Install]
-WantedBy=graphical.target
+WantedBy=multi-user.target

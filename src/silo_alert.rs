@@ -5,7 +5,7 @@
 //!   Open-drain: OUTPUT LOW = TX (sink); idle = INPUT High-Z (Bias::Off).
 //!   The Pi must never drive 3.3 V into the SA828 PTT line — the module's
 //!   own pull-up holds idle inactive. Do not use OUTPUT HIGH or pull-up bias.
-//!   SPKEN (SA828 pin 9) -> Pi GPIO (default off; e.g. GPIO24 / header pin 18).
+//!   SPKEN (SA828 pin 9) -> Pi GPIO24, header pin 18.
 //!   SPKEN high = channel busy (receiving); low = free. Module VCC must be
 //!   3.3 V or level-shift — Pi GPIO is not 5 V tolerant.
 //!   Audio: Pi 3.5 mm jack -> series pot -> MIC+/MIC-.

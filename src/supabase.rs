@@ -128,6 +128,22 @@ impl Supabase {
         });
     }
 
+    /// `checks` holds the `vcgencmd get_throttled` bitmask (0 = healthy).
+    pub fn push_power(&self, throttled: u32) {
+        self.enqueue(EventRow {
+            site_id: &self.site_id,
+            ts: Some(now_rfc3339()),
+            kind: "power",
+            empty: None,
+            confidence: None,
+            checks: Some(u64::from(throttled)),
+            empty_hits: None,
+            alerts_sent: None,
+            labels_empty: None,
+            labels_full: None,
+        });
+    }
+
     pub fn push_heartbeat(&self, stats: &Stats) {
         self.enqueue(EventRow {
             site_id: &self.site_id,
@@ -231,6 +247,41 @@ impl Supabase {
         format!("{}/empty/{file_name}", self.site_id)
     }
 
+    /// Drop the compact log (checks and heartbeats) older than 30 days.
+    /// Alerts, radio and camera events are left in place.
+    pub fn purge_expired_logs(&self) {
+        let cutoff = now_unix().saturating_sub(30 * 24 * 60 * 60);
+        let ts = query_escape(&unix_to_rfc3339(cutoff));
+        let url = format!(
+            "{}/rest/v1/silo_events?site_id=eq.{}&kind=in.(check,heartbeat,power)&ts=lt.{ts}",
+            self.base,
+            urlencoding_site(&self.site_id),
+        );
+        let key = self.key.clone();
+        thread::spawn(move || match ureq::delete(&url)
+            .set("apikey", &key)
+            .set("Authorization", &format!("Bearer {key}"))
+            .set("Prefer", "return=minimal")
+            .timeout(Duration::from_secs(20))
+            .call()
+        {
+            Ok(resp) => {
+                let status = resp.status();
+                if (200..300).contains(&status) {
+                    eprintln!("supabase: purged logs older than 30 days");
+                } else {
+                    eprintln!("supabase: log purge HTTP {status}");
+                }
+            }
+            Err(ureq::Error::Status(code, resp)) => {
+                let body = resp.into_string().unwrap_or_default();
+                let snippet: String = body.chars().take(160).collect();
+                eprintln!("supabase: log purge HTTP {code} {snippet}");
+            }
+            Err(e) => eprintln!("supabase: log purge {e}"),
+        });
+    }
+
     /// Pull empty-alert timestamps for this site (newest first, then sorted asc).
     pub fn fetch_empty_alerts(&self, limit: usize) -> Result<Vec<u64>, String> {
         let lim = limit.clamp(1, 2000);
@@ -274,10 +325,13 @@ struct TsRow {
 }
 
 fn urlencoding_site(site: &str) -> String {
-    // site_id is controlled (config); keep PostgREST filter safe.
-    site.chars()
+    query_escape(site)
+}
+
+fn query_escape(s: &str) -> String {
+    s.chars()
         .map(|c| match c {
-            'A'..='Z' | 'a'..='z' | '0'..='9' | '-' | '_' => c.to_string(),
+            'A'..='Z' | 'a'..='z' | '0'..='9' | '-' | '_' | '.' => c.to_string(),
             _ => format!("%{:02X}", c as u8),
         })
         .collect()

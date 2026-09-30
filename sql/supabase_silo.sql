@@ -23,7 +23,7 @@ create table if not exists silo_events (
   id bigint generated always as identity primary key,
   site_id text not null default 'spectr-pi',
   ts timestamptz not null default now(),
-  -- empty_alert | check | heartbeat | camera_down | camera_up | radio_tx | radio_fail
+  -- empty_alert | full | heartbeat | power | camera_down | camera_up | radio_tx | radio_fail
   -- app_start | armed | disarmed
   kind text not null,
   empty boolean,
@@ -44,6 +44,7 @@ alter table silo_allowed_sites enable row level security;
 
 drop policy if exists "anon insert events" on silo_events;
 drop policy if exists "anon select events" on silo_events;
+drop policy if exists "anon delete old logs" on silo_events;
 drop policy if exists "anon select sites" on silo_allowed_sites;
 
 create policy "anon insert events" on silo_events
@@ -54,12 +55,21 @@ create policy "anon select events" on silo_events
   for select to anon, authenticated
   using (site_id in (select site_id from silo_allowed_sites));
 
+-- Verbose log rows only. empty_alert and radio/camera events stay.
+create policy "anon delete old logs" on silo_events
+  for delete to anon, authenticated
+  using (
+    site_id in (select site_id from silo_allowed_sites)
+    and ts < now() - interval '30 days'
+    and kind in ('check', 'heartbeat', 'power')
+  );
+
 create policy "anon select sites" on silo_allowed_sites
   for select to anon, authenticated
   using (true);
 
 grant usage on schema public to anon, authenticated;
-grant insert, select on table public.silo_events to anon, authenticated;
+grant insert, select, delete on table public.silo_events to anon, authenticated;
 grant select on table public.silo_allowed_sites to anon, authenticated;
 
 do $$
