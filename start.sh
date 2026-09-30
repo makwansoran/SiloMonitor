@@ -1,12 +1,16 @@
 #!/usr/bin/env bash
-# Spectr Vision — start the desktop app, building it first if needed.
+# Industrial Smart System — start the desktop app, building it first if needed.
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")" && pwd)"
 cd "$ROOT"
 
+# Cursor/agent sandboxes may set CARGO_TARGET_DIR elsewhere; always build into
+# this repo's target/ so we exec the binary we just compiled.
+unset CARGO_TARGET_DIR
+
 BIN="$ROOT/target/release/silo-alert"
 if [[ ! -x "$BIN" ]] || find src Cargo.toml -newer "$BIN" | grep -q .; then
-  echo "Building Spectr Vision…"
+  echo "Building Industrial Smart System…"
   cargo build --release
 fi
 

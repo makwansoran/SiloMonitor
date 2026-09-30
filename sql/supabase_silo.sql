@@ -23,7 +23,7 @@ create table if not exists silo_events (
   id bigint generated always as identity primary key,
   site_id text not null default 'spectr-pi',
   ts timestamptz not null default now(),
-  -- empty_alert | heartbeat | camera_down | camera_up | radio_tx | radio_fail
+  -- empty_alert | check | heartbeat | camera_down | camera_up | radio_tx | radio_fail
   -- app_start | armed | disarmed
   kind text not null,
   empty boolean,
@@ -82,7 +82,7 @@ values (
   'silo-frames',
   false,
   5242880,
-  array['image/jpeg']
+  array['image/jpeg', 'application/json']
 )
 on conflict (id) do update set
   file_size_limit = excluded.file_size_limit,

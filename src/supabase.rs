@@ -146,7 +146,12 @@ impl Supabase {
     /// Upload a JPEG to the `silo-frames` bucket (e.g. `{site}/latest.jpg`).
     /// Runs on a background thread so the UI never blocks on Storage.
     pub fn upload_jpeg(&self, object_path: &str, jpeg: Vec<u8>) {
-        if jpeg.is_empty() || object_path.is_empty() {
+        self.upload_bytes(object_path, jpeg, "image/jpeg");
+    }
+
+    /// Upload bytes to Storage. The Pi does not keep a second copy in memory.
+    pub fn upload_bytes(&self, object_path: &str, bytes: Vec<u8>, content_type: &str) {
+        if bytes.is_empty() || object_path.is_empty() {
             return;
         }
         let url = format!(
@@ -156,14 +161,15 @@ impl Supabase {
             object_path.trim_start_matches('/')
         );
         let key = self.key.clone();
+        let content_type = content_type.to_string();
         thread::spawn(move || {
             match ureq::put(&url)
                 .set("apikey", &key)
                 .set("Authorization", &format!("Bearer {key}"))
-                .set("Content-Type", "image/jpeg")
+                .set("Content-Type", &content_type)
                 .set("x-upsert", "true")
                 .timeout(Duration::from_secs(20))
-                .send_bytes(&jpeg)
+                .send_bytes(&bytes)
             {
                 Ok(resp) => {
                     let status = resp.status();
@@ -181,6 +187,31 @@ impl Supabase {
         });
     }
 
+    /// Read one object back from Storage.
+    pub fn download_object(&self, object_path: &str) -> Result<Vec<u8>, String> {
+        let url = format!(
+            "{}/storage/v1/object/{}/{}",
+            self.base,
+            FRAME_BUCKET,
+            object_path.trim_start_matches('/')
+        );
+        let resp = ureq::get(&url)
+            .set("apikey", &self.key)
+            .set("Authorization", &format!("Bearer {}", self.key))
+            .timeout(Duration::from_secs(12))
+            .call()
+            .map_err(|e| e.to_string())?;
+        let mut bytes = Vec::new();
+        use std::io::Read;
+        resp.into_reader()
+            .read_to_end(&mut bytes)
+            .map_err(|e| e.to_string())?;
+        if bytes.is_empty() {
+            return Err("empty object".into());
+        }
+        Ok(bytes)
+    }
+
     /// Live preview path for this site.
     pub fn latest_frame_path(&self) -> String {
         format!("{}/latest.jpg", self.site_id)
@@ -189,6 +220,15 @@ impl Supabase {
     /// Alert evidence path for this site.
     pub fn alert_frame_path(&self, unix: u64) -> String {
         format!("{}/alerts/{unix}.jpg", self.site_id)
+    }
+
+    /// The comparison model (feature vectors), small enough to pull back.
+    pub fn reference_path(&self) -> String {
+        format!("{}/reference.json", self.site_id)
+    }
+
+    pub fn empty_photo_path(&self, file_name: &str) -> String {
+        format!("{}/empty/{file_name}", self.site_id)
     }
 
     /// Pull empty-alert timestamps for this site (newest first, then sorted asc).

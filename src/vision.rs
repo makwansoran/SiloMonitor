@@ -599,6 +599,19 @@ pub fn save_alert_evidence(
     let json = PathBuf::from(ALERTS_DIR).join(format!("{unix}.json"));
     fs::write(&json, serde_json::to_string_pretty(&meta).unwrap_or_default())
         .map_err(|e| e.to_string())?;
+    // The cloud keeps the history. The Pi only needs the frame on screen.
+    if let Ok(rd) = fs::read_dir(ALERTS_DIR) {
+        for e in rd.filter_map(|e| e.ok()) {
+            let path = e.path();
+            let stem = path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .and_then(|s| s.parse::<u64>().ok());
+            if stem != Some(unix) {
+                let _ = fs::remove_file(path);
+            }
+        }
+    }
     Ok(jpg)
 }
 

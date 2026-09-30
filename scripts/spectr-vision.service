@@ -1,5 +1,5 @@
 [Unit]
-Description=Spectr Vision — silo empty monitoring
+Description=Industrial Smart System — silo empty monitoring
 # Ethernet camera + desktop session. Do not wait for USB video0.
 After=graphical.target network-online.target
 Wants=graphical.target network-online.target

@@ -43,6 +43,7 @@ const LOG_MAX_BYTES: u64 = 2 * 1024 * 1024;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Page {
+    Home,
     Live,
     Model,
     Stats,
@@ -57,10 +58,9 @@ enum ConfigTab {
     App,
 }
 
-/// One terminal line: text, plus the frame it describes when there is one.
+/// One terminal line. Pictures stay in Supabase, not in this buffer.
 struct TermEntry {
     text: String,
-    thumb: Option<egui::TextureHandle>,
 }
 
 struct App {
@@ -125,8 +125,6 @@ struct App {
     last_heartbeat: Option<Instant>,
     evidence_tex: Option<egui::TextureHandle>,
     evidence_path: Option<std::path::PathBuf>,
-    /// Last successful cloud still upload (throttled).
-    last_frame_upload: Option<Instant>,
 }
 
 impl App {
@@ -134,7 +132,8 @@ impl App {
         vision::ensure_dirs();
         let cfg = Config::load();
         let mut stats = Stats::load();
-        let reference = Reference::load();
+        let cloud = Supabase::from_cfg(&cfg.supabase);
+        let reference = sync_reference(cloud.as_ref(), Reference::load());
         stats.labels_empty = vision::list_references().len() as u64;
         stats.labels_full = vision::list_full_samples().len() as u64;
         if reference.is_none() {
@@ -151,7 +150,6 @@ impl App {
         let log_path = cfg.resolve_db_path().with_extension("jsonl");
         let text_log = cfg.resolve_db_path().with_extension("log");
         let mut empty_alerts = EventLog::load_empty_alerts(&log_path);
-        let cloud = Supabase::from_cfg(&cfg.supabase);
         let mut last_cloud_pull = None;
         if let Some(ref sb) = cloud {
             eprintln!("supabase: enabled site={}", sb.site_id());
@@ -193,7 +191,7 @@ impl App {
             alert: Some(alert),
             stats,
             monitor,
-            page: Page::Live,
+            page: Page::Home,
             events: EventLog::open(log_path),
             empty_alerts,
             empty_since: resume_empty_since,
@@ -234,7 +232,6 @@ impl App {
             last_heartbeat: None,
             evidence_tex: None,
             evidence_path: vision::latest_alert_evidence(),
-            last_frame_upload: None,
         }
     }
 
@@ -293,7 +290,6 @@ impl App {
                     }
                 }
                 self.last_rgb = Some((w, h, rgb));
-                self.maybe_upload_live_frame();
             }
             None => self.handle_camera_loss(),
         }
@@ -316,7 +312,7 @@ impl App {
             return;
         }
         if let Some((w, h, rgb)) = self.last_rgb.clone() {
-            self.run_check(ctx, w, h, &rgb);
+            self.run_check(w, h, &rgb);
         }
     }
 
@@ -438,22 +434,6 @@ impl App {
                             };
                             ui.horizontal(|ui| {
                                 ui.add_space(16.0);
-                                // Keep text aligned whether or not there is a picture.
-                                let slot = Vec2::new(26.0, 15.0);
-                                let (r, _) = ui.allocate_exact_size(slot, Sense::hover());
-                                if let Some(tex) = entry.thumb.as_ref() {
-                                    let s = tex.size_vec2();
-                                    let scale =
-                                        (slot.x / s.x).min(slot.y / s.y).max(0.01);
-                                    let draw = s * scale;
-                                    let img = egui::Rect::from_center_size(r.center(), draw);
-                                    let uv = egui::Rect::from_min_max(
-                                        egui::pos2(0.0, 0.0),
-                                        egui::pos2(1.0, 1.0),
-                                    );
-                                    ui.painter().image(tex.id(), img, uv, Color32::WHITE);
-                                }
-                                ui.add_space(8.0);
                                 ui.label(
                                     RichText::new(&entry.text)
                                         .size(12.0)
@@ -1255,37 +1235,26 @@ impl App {
         }
     }
 
-    /// Push a JPEG still to Supabase Storage for the later cloud app.
-    /// Throttled to the level check interval (min 15s).
-    fn maybe_upload_live_frame(&mut self) {
+    /// The frame that was just compared. Cloud keeps it. Disk does not,
+    /// unless this check is the one that raises the empty alert.
+    fn store_compared_frame(&self, w: u32, h: u32, rgb: &[u8], alert_unix: Option<u64>) {
         let Some(cloud) = &self.cloud else {
             return;
         };
-        let interval = self.cfg.level.check_interval_seconds.max(15.0);
-        let due = self
-            .last_frame_upload
-            .map(|t| t.elapsed().as_secs_f32() >= interval)
-            .unwrap_or(true);
-        if !due {
-            return;
+        if let Ok(jpeg) = vision::rgb_to_jpeg_bytes(w, h, rgb, 75) {
+            cloud.upload_jpeg(&cloud.latest_frame_path(), jpeg);
         }
-        let Some((w, h, rgb)) = self.last_rgb.as_ref() else {
+        let Some(unix) = alert_unix else {
             return;
         };
-        let Ok(jpeg) = vision::rgb_to_jpeg_bytes(*w, *h, rgb, 75) else {
-            return;
-        };
-        cloud.upload_jpeg(&cloud.latest_frame_path(), jpeg);
-        self.last_frame_upload = Some(Instant::now());
+        if let Ok(jpeg) = vision::rgb_to_jpeg_bytes(w, h, rgb, 75) {
+            cloud.upload_jpeg(&cloud.alert_frame_path(unix), jpeg);
+        }
     }
 
     fn term_line(&mut self, line: String) {
-        self.term_entry(line, None);
-    }
-
-    fn term_entry(&mut self, text: String, thumb: Option<egui::TextureHandle>) {
-        append_log(&self.log_path, &text);
-        self.terminal.push_back(TermEntry { text, thumb });
+        append_log(&self.log_path, &line);
+        self.terminal.push_back(TermEntry { text: line });
         while self.terminal.len() > TERM_MAX {
             self.terminal.pop_front();
         }
@@ -1297,7 +1266,7 @@ impl App {
     }
 
     /// One Live cycle: model decides empty/full from training only (no human confirm).
-    fn run_check(&mut self, ctx: &egui::Context, w: u32, h: u32, rgb: &[u8]) {
+    fn run_check(&mut self, w: u32, h: u32, rgb: &[u8]) {
         self.last_check_at = Some(Instant::now());
 
         let Some(reference) = self.reference.as_ref() else {
@@ -1383,14 +1352,10 @@ impl App {
             if let Some(cloud) = &self.cloud {
                 cloud.push_empty_alert(unix);
             }
+            self.store_compared_frame(w, h, rgb, Some(unix));
             if let Ok(path) =
                 vision::save_alert_evidence(w, h, rgb, roi, unix, score, threshold, self.empty_streak)
             {
-                if let Some(cloud) = &self.cloud {
-                    if let Ok(bytes) = std::fs::read(&path) {
-                        cloud.upload_jpeg(&cloud.alert_frame_path(unix), bytes);
-                    }
-                }
                 self.evidence_path = Some(path);
                 self.evidence_tex = None;
             }
@@ -1413,25 +1378,23 @@ impl App {
             }
         }
 
+        if !just_confirmed {
+            self.store_compared_frame(w, h, rgb, None);
+        }
+
         let kind = if looks_empty { "empty" } else { "full" };
-        // A small picture of exactly what was compared, shown in the log.
-        let shot = {
-            let (tw, th, pixels) = vision::thumb_from_rgb(w, h, rgb, roi, 72);
-            let img = egui::ColorImage::from_rgb([tw as usize, th as usize], &pixels);
-            Some(ctx.load_texture(format!("shot_{unix}"), img, Default::default()))
-        };
+        if let Some(cloud) = &self.cloud {
+            cloud.push_event("check", Some(looks_empty), Some(score));
+        }
         let cooldown = looks_empty && self.empty && !alerted;
         let conf = self
             .confidence()
             .map(|c| format!("  conf {:.0}%", c * 100.0))
             .unwrap_or_default();
-        self.term_entry(
-            format!(
-                "{ts}  check  {kind}  match {pct:.0}%{conf}{}",
-                if cooldown { "  (already alerted)" } else { "" }
-            ),
-            shot,
-        );
+        self.term_line(format!(
+            "{ts}  check  {kind}  match {pct:.0}%{conf}{}",
+            if cooldown { "  (already alerted)" } else { "" }
+        ));
         if just_confirmed {
             self.term_line(format!("{ts}  empty confirmed"));
         } else if just_filled {
@@ -1672,7 +1635,15 @@ impl App {
             return;
         };
         match vision::save_reference_photo(w, h, &rgb) {
-            Ok(_) => {
+            Ok(path) => {
+                if let Some(cloud) = &self.cloud {
+                    if let (Ok(bytes), Some(name)) = (
+                        std::fs::read(&path),
+                        path.file_name().and_then(|n| n.to_str()),
+                    ) {
+                        cloud.upload_jpeg(&cloud.empty_photo_path(name), bytes);
+                    }
+                }
                 self.dataset_dirty = true;
                 self.rebuild_reference();
             }
@@ -1680,7 +1651,20 @@ impl App {
         }
     }
 
-    /// Recompute the reference from every photo on disk.
+    fn publish_reference(&self) {
+        let Some(cloud) = &self.cloud else {
+            return;
+        };
+        let Some(reference) = &self.reference else {
+            return;
+        };
+        let Ok(bytes) = serde_json::to_vec(reference) else {
+            return;
+        };
+        cloud.upload_bytes(&cloud.reference_path(), bytes, "application/json");
+    }
+
+    /// Recompute the reference from every photo on disk, then send it up.
     fn rebuild_reference(&mut self) {
         match vision::build_reference() {
             Ok(r) => {
@@ -1692,6 +1676,7 @@ impl App {
                 self.stats.save();
                 let warn = r.cohesion_warning();
                 self.reference = Some(r);
+                self.publish_reference();
                 self.note = match warn {
                     Some(w) => format!("Reference updated — {n} photos. {w}"),
                     None => format!("Reference updated — {n} photos"),
@@ -2354,6 +2339,7 @@ impl eframe::App for App {
         ctx.request_repaint_after(Duration::from_millis(100));
 
         let has_reference = self.reference.is_some();
+        let is_home = self.page == Page::Home;
 
         egui::TopBottomPanel::top("navbar")
             .exact_height(NAV_H)
@@ -2385,22 +2371,24 @@ impl eframe::App for App {
                     .hline(r.x_range(), r.bottom() - 0.5, Stroke::new(1.0_f32, HAIRLINE));
             });
 
-        egui::SidePanel::right("side")
-            .exact_width(356.0)
-            .resizable(false)
-            .frame(
-                egui::Frame::new()
-                    .fill(CARD)
-                    // Less padding on the right: the scrollbar lives there.
-                    .inner_margin(egui::Margin {
-                        left: 22,
-                        right: 10,
-                        top: 22,
-                        bottom: 22,
-                    }),
-            )
-            .show(ctx, |ui| {
-                match self.page {
+        // Home is a blank canvas — no plant sidebar / terminal.
+        if !is_home {
+            egui::SidePanel::right("side")
+                .exact_width(356.0)
+                .resizable(false)
+                .frame(
+                    egui::Frame::new()
+                        .fill(CARD)
+                        .inner_margin(egui::Margin {
+                            left: 22,
+                            right: 10,
+                            top: 22,
+                            bottom: 22,
+                        }),
+                )
+                .show(ctx, |ui| {
+                    match self.page {
+                    Page::Home => {}
                     Page::Live => {
                         let interval = self.cfg.level.check_interval_seconds.max(1.0);
                         let next_in = self
@@ -2724,17 +2712,25 @@ impl eframe::App for App {
                     }
                 }
             });
+        }
 
-        self.draw_terminal_panel(ctx);
+        if !is_home {
+            self.draw_terminal_panel(ctx);
+        }
 
         egui::CentralPanel::default()
             .frame(
                 egui::Frame::new()
                     .fill(BG)
-                    .inner_margin(egui::Margin::same(16)),
+                    .inner_margin(if is_home {
+                        egui::Margin::ZERO
+                    } else {
+                        egui::Margin::same(16)
+                    }),
             )
             .show(ctx, |ui| {
                 match self.page {
+                    Page::Home => {}
                     Page::Stats => self.stats_main(ui),
                     Page::Model => self.draw_library_grid(ui, ctx),
                     _ => self.draw_live_view(ui),
@@ -2816,6 +2812,7 @@ fn style(ctx: &egui::Context) {
 fn nav_bar(ui: &mut egui::Ui, page: &mut Page) {
     ui.spacing_mut().item_spacing = Vec2::ZERO;
     let items = [
+        (Page::Home, "Home"),
         (Page::Live, "Live"),
         (Page::Model, "Model"),
         (Page::Stats, "Stats"),
@@ -2928,6 +2925,42 @@ fn merge_alert_ts(remote: Vec<u64>, local: Vec<u64>) -> Vec<u64> {
     out.sort_unstable();
     out.dedup();
     out
+}
+
+/// Supabase holds the reference. Memory keeps whichever copy is newer.
+/// A local file is only the cache used when the network is down.
+fn sync_reference(cloud: Option<&Supabase>, local: Option<Reference>) -> Option<Reference> {
+    let Some(cloud) = cloud else {
+        return local;
+    };
+    let remote = cloud
+        .download_object(&cloud.reference_path())
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<Reference>(&bytes).ok())
+        .filter(|r| !r.frames.is_empty());
+    match (local, remote) {
+        (Some(local), Some(remote)) if remote.built_at_unix > local.built_at_unix => {
+            let _ = remote.save();
+            eprintln!("supabase: reference pulled ({})", remote.built_at_unix);
+            Some(remote)
+        }
+        (Some(local), remote) => {
+            let remote_ts = remote.as_ref().map(|r| r.built_at_unix).unwrap_or(0);
+            if local.built_at_unix > remote_ts {
+                if let Ok(bytes) = serde_json::to_vec(&local) {
+                    cloud.upload_bytes(&cloud.reference_path(), bytes, "application/json");
+                    eprintln!("supabase: reference pushed ({})", local.built_at_unix);
+                }
+            }
+            Some(local)
+        }
+        (None, Some(remote)) => {
+            let _ = remote.save();
+            eprintln!("supabase: reference pulled ({})", remote.built_at_unix);
+            Some(remote)
+        }
+        (None, None) => None,
+    }
 }
 
 fn row_stat(ui: &mut egui::Ui, k: &str, v: &str) {
@@ -3179,18 +3212,18 @@ fn main() -> eframe::Result {
             None
         }
     };
-    eprintln!("opening Spectr Vision");
+    eprintln!("opening Industrial Smart System");
 
     let opts = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1180.0, 720.0])
-            .with_title("Spectr Vision"),
+            .with_title("Industrial Smart System"),
         renderer: eframe::Renderer::Glow,
         ..Default::default()
     };
 
     eframe::run_native(
-        "Spectr Vision",
+        "Industrial Smart System",
         opts,
         Box::new(move |_cc| Ok(Box::new(App::new(cam)))),
     )

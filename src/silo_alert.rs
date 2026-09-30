@@ -71,12 +71,64 @@ pub fn channel_busy() -> Option<bool> {
 }
 
 fn audio_device() -> String {
-    AUDIO_DEVICE
+    let configured = AUDIO_DEVICE
         .lock()
         .ok()
         .map(|g| g.clone())
         .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| DEFAULT_AUDIO.to_string())
+        .unwrap_or_else(|| DEFAULT_AUDIO.to_string());
+    resolve_playback_device(&configured)
+}
+
+/// Card id inside `plughw:CARD=<id>,DEV=0`.
+fn card_id(device: &str) -> Option<&str> {
+    let rest = device.split("CARD=").nth(1)?;
+    let id = rest.split([',', ':']).next()?.trim();
+    if id.is_empty() { None } else { Some(id) }
+}
+
+/// ALSA card ids from `/proc/asound/cards`, plus whether the line is USB.
+fn alsa_cards() -> Vec<(String, bool)> {
+    let text = std::fs::read_to_string("/proc/asound/cards").unwrap_or_default();
+    let mut out = Vec::new();
+    for line in text.lines() {
+        let Some(start) = line.find('[') else { continue };
+        let Some(end) = line[start + 1..].find(']') else { continue };
+        let id = line[start + 1..start + 1 + end].trim();
+        if id.is_empty() {
+            continue;
+        }
+        let usb = line.to_ascii_lowercase().contains("usb");
+        out.push((id.to_string(), usb));
+    }
+    out
+}
+
+fn plughw(card: &str) -> String {
+    format!("plughw:CARD={card},DEV=0")
+}
+
+/// Use the configured card when it exists. Pi 5 has no Headphones jack, so a
+/// saved `CARD=Headphones` device makes aplay exit immediately and PTT only blinks.
+/// Prefer a USB card, then any other card.
+fn resolve_playback_device(configured: &str) -> String {
+    let cards = alsa_cards();
+    if cards.is_empty() {
+        return configured.to_string();
+    }
+    if let Some(id) = card_id(configured) {
+        if cards.iter().any(|(name, _)| name == id) {
+            return configured.to_string();
+        }
+    }
+    let picked = cards
+        .iter()
+        .find(|(_, usb)| *usb)
+        .or_else(|| cards.first())
+        .map(|(name, _)| plughw(name))
+        .unwrap_or_else(|| configured.to_string());
+    eprintln!("radio: audio device '{configured}' is missing — using {picked}");
+    picked
 }
 
 /// Result of the last transmission, consumed once by the UI.
