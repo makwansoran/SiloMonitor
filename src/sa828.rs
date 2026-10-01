@@ -117,7 +117,10 @@ fn write_all(uart: &mut Uart, cmd: &[u8]) -> Result<(), String> {
         }
         sent += n;
     }
-    uart.flush(Queue::Output).map_err(|e| e.to_string())?;
+    // rppal flush() discards the queue (tcflush). drain() waits until the
+    // bytes have left the Pi (tcdrain). AAFA3 is ~300 bytes at 9600 baud;
+    // discarding here chops the command and the module keeps the old channel.
+    uart.drain().map_err(|e| e.to_string())?;
     Ok(())
 }
 
