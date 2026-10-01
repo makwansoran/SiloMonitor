@@ -984,7 +984,7 @@ impl App {
 
         ui.checkbox(&mut self.cfg.supabase.enabled, "Send events to Supabase")
             .on_hover_text(
-                "Events → silo_events. Live stills → Storage silo-frames/{site}/latest.jpg. Offline rows stay queued.",
+                "Each fact has its own Supabase table. Stills → silo-frames/{site}/latest.jpg. Offline rows stay queued.",
             );
         ui.add_space(10.0);
         row_stat(ui, "Cloud", &cloud_status(self.cloud.is_some()));
@@ -992,7 +992,7 @@ impl App {
         if supabase::schema_missing() {
             ui.add_space(8.0);
             ui.label(
-                RichText::new("silo_events is missing. Run sql/supabase_silo.sql in the SQL Editor.")
+                RichText::new("Supabase tables are missing. Run sql/supabase_silo.sql in the SQL Editor.")
                     .size(12.0)
                     .color(RED),
             );
