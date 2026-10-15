@@ -40,8 +40,13 @@ const VOLUME_TEST_CLIPS: &[(&str, &str)] = &[
 ];
 
 static TX_BUSY: AtomicBool = AtomicBool::new(false);
+static PTT_KEYED: AtomicBool = AtomicBool::new(false);
 static PTT_PIN: AtomicU8 = AtomicU8::new(0);
 static SPKEN_PIN: AtomicU8 = AtomicU8::new(0);
+static CH_BIT1: AtomicU8 = AtomicU8::new(0);
+static CH_BIT2: AtomicU8 = AtomicU8::new(0);
+static CH_BIT4: AtomicU8 = AtomicU8::new(0);
+static CH_BIT8: AtomicU8 = AtomicU8::new(0);
 static MUTED: AtomicBool = AtomicBool::new(false);
 static AUDIO_DEVICE: Mutex<String> = Mutex::new(String::new());
 static STATUS: Mutex<Option<String>> = Mutex::new(None);
@@ -54,6 +59,84 @@ pub fn set_ptt_pin(pin: u8) {
 pub fn set_spken_pin(pin: u8) {
     SPKEN_PIN.store(pin, Ordering::SeqCst);
 }
+
+/// BCM pins for SA828 channel bits 1, 2, 4 and 8. A 0 leaves that bit unwired.
+pub fn set_channel_pins(bit1: u8, bit2: u8, bit4: u8, bit8: u8) {
+    let prev1 = CH_BIT1.swap(bit1, Ordering::SeqCst);
+    let prev2 = CH_BIT2.swap(bit2, Ordering::SeqCst);
+    let prev4 = CH_BIT4.swap(bit4, Ordering::SeqCst);
+    let prev8 = CH_BIT8.swap(bit8, Ordering::SeqCst);
+    if prev1 != bit1 || prev2 != bit2 || prev4 != bit4 || prev8 != bit8 {
+        if let Ok(mut held) = CHANNEL_OUT.lock() {
+            *held = None;
+        }
+    }
+}
+
+/// Drive SA828 pins 4, 5, 7 and 6 so the module transmits on `ch`.
+///
+/// NiceRF SA828 channel encode is active-low: open/high = digit 0,
+/// ground/low = digit 1 (same as the rotary channel switch).
+pub fn select_channel(ch: u8) -> Result<(), String> {
+    let code = crate::peltor::sa828_channel_code(ch);
+    let pins = [
+        CH_BIT1.load(Ordering::SeqCst),
+        CH_BIT2.load(Ordering::SeqCst),
+        CH_BIT4.load(Ordering::SeqCst),
+        CH_BIT8.load(Ordering::SeqCst),
+    ];
+    if pins.iter().any(|p| *p == 0) {
+        return Err(
+            "Channel pins not wired. SA828 pins 4, 5, 7, 6 → Pi GPIO 5, 6, 12, 13.".into(),
+        );
+    }
+    let mut held = CHANNEL_OUT
+        .lock()
+        .map_err(|_| "channel gpio busy".to_string())?;
+    if held.is_none() {
+        *held = Some(open_channel_pins(pins)?);
+    }
+    let outs = held.as_mut().ok_or("channel gpio missing")?;
+    // Active-low: set bit → drive low; clear bit → drive high.
+    drive_active_low(&mut outs.bit1, code & 0b0001 != 0);
+    drive_active_low(&mut outs.bit2, code & 0b0010 != 0);
+    drive_active_low(&mut outs.bit4, code & 0b0100 != 0);
+    drive_active_low(&mut outs.bit8, code & 0b1000 != 0);
+    Ok(())
+}
+
+fn drive_active_low(pin: &mut OutputPin, bit_set: bool) {
+    if bit_set {
+        pin.set_low();
+    } else {
+        pin.set_high();
+    }
+}
+
+struct ChannelOut {
+    bit1: OutputPin,
+    bit2: OutputPin,
+    bit4: OutputPin,
+    bit8: OutputPin,
+}
+
+fn open_channel_pins(pins: [u8; 4]) -> Result<ChannelOut, String> {
+    let gpio = Gpio::new().map_err(|e| format!("GPIO: {e}"))?;
+    let open = |pin: u8| -> Result<OutputPin, String> {
+        Ok(gpio
+            .get(pin)
+            .map_err(|e| format!("channel GPIO{pin}: {e}"))?
+            .into_output())
+    };
+    Ok(ChannelOut {
+        bit1: open(pins[0])?,
+        bit2: open(pins[1])?,
+        bit4: open(pins[2])?,
+        bit8: open(pins[3])?,
+    })
+}
+
+static CHANNEL_OUT: Mutex<Option<ChannelOut>> = Mutex::new(None);
 
 pub fn set_audio_device(dev: &str) {
     if let Ok(mut g) = AUDIO_DEVICE.lock() {
@@ -68,6 +151,27 @@ pub fn set_muted(muted: bool) {
 /// Live channel occupancy from SPKEN. `None` = pin disabled / unreadable.
 pub fn channel_busy() -> Option<bool> {
     read_spken_busy().ok()
+}
+
+/// Same three states as the LED on the SA828.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum LineLamp {
+    /// Channel clear. Draw nothing.
+    Off,
+    /// SPKEN high: someone else is on the channel.
+    Busy,
+    /// Local PTT is held.
+    Tx,
+}
+
+pub fn line_lamp() -> LineLamp {
+    if PTT_KEYED.load(Ordering::SeqCst) {
+        return LineLamp::Tx;
+    }
+    if channel_busy() == Some(true) {
+        return LineLamp::Busy;
+    }
+    LineLamp::Off
 }
 
 fn audio_device() -> String {
@@ -191,8 +295,11 @@ struct Ptt(Option<OutputPin>);
 
 impl Ptt {
     fn key() -> Result<Self, String> {
-        // No lead-in: key and start audio immediately.
-        Ok(Self(key_ptt_pin()?))
+        let this = Self(key_ptt_pin()?);
+        if this.is_keyed() {
+            PTT_KEYED.store(true, Ordering::SeqCst);
+        }
+        Ok(this)
     }
 
     fn is_keyed(&self) -> bool {
@@ -202,6 +309,7 @@ impl Ptt {
 
 impl Drop for Ptt {
     fn drop(&mut self) {
+        PTT_KEYED.store(false, Ordering::SeqCst);
         // No tail: release PTT the moment aplay finishes.
         // Do not set_high() — that drives 3.3 V into SA828 PTT.
         drop(self.0.take());
@@ -260,7 +368,7 @@ impl SiloAlert {
         self.announced = false;
     }
 
-    /// Test radio: PTT + WAV once, then idle. Works when disarmed.
+    /// Test radio: PTT + WAV once, then idle. Works while monitoring is stopped.
     /// `wav` overrides the production empty clip (volume-test files).
     pub fn test_transmit(&mut self, wav: Option<PathBuf>) -> Result<(), String> {
         if transmit_wav(wav) {

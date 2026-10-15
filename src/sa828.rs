@@ -5,17 +5,13 @@ use std::time::Duration;
 
 use crate::peltor;
 
-/// Pi 4 hardware UART on GPIO14/15 (pins 8/10). Prefer serial0 over USB stick.
-const PORTS: [&str; 5] = [
-    "/dev/serial0",
-    "/dev/ttyAMA0",
-    "/dev/ttyS0",
-    "/dev/ttyUSB0",
-    "/dev/ttyACM0",
-];
+/// GPIO14/15 (header pins 8/10). On Pi 5 that device is ttyAMA0, not serial0.
+const PORTS: [&str; 4] = ["/dev/ttyAMA0", "/dev/ttyS0", "/dev/ttyUSB0", "/dev/ttyACM0"];
 
-/// Accept TX/RX within this many Hz of the requested frequency.
-const FREQ_MATCH_HZ: f64 = 100.0;
+/// SA828 stores 100 Hz coarser than the 4-decimal command (446.0312 comes back
+/// as 446.0311). A real channel step is 12.5 kHz, so 250 Hz still rejects
+/// the wrong Peltor channel.
+const FREQ_MATCH_HZ: f64 = 250.0;
 
 /// UHF simplex, 4 decimal places (SA828 UART format).
 pub fn normalize_freq(raw: &str) -> Result<String, String> {
@@ -31,39 +27,39 @@ pub fn clamp_squelch(s: u8) -> u8 {
     s.min(8)
 }
 
-/// AAFA protocol over the Pi hardware UART (SA828 TXD↔Pi RXD, RXD↔Pi TXD).
-///
-/// `ctcss` is 0 = Off, 1–38 = standard tone (same on TX and RX).
-/// Success requires channel-1 TX and RX to match the requested frequency.
-pub fn program(freq: &str, squelch: u8, ctcss: u8, port: &str) -> Result<String, String> {
-    let freq = normalize_freq(freq)?;
+pub fn program_plan(squelch: u8, ctcss: u8, port: &str) -> Result<String, String> {
+    let freqs: Vec<String> = (1..=16).map(peltor::sa828_freq_for_channel).collect();
     let sq = clamp_squelch(squelch);
     let tone = peltor::clamp_ctcss(ctcss);
-    let cmd = format!("AAFA3{}\r\n", set_payload(&freq, sq, tone));
+    let mut pairs = Vec::with_capacity(16);
+    for freq in &freqs {
+        let freq = normalize_freq(freq)?;
+        pairs.push(format!("{freq},{freq}"));
+    }
+    let cmd = format!(
+        "AAFA3{},{tone:03},{tone:03},{sq}\r\n",
+        pairs.join(",")
+    );
     let path = pick_port(port)?;
-
     let mut uart = open_uart(&path)?;
     chat(&mut uart, b"AAFAA\r\n", 600)?;
     let set = chat(&mut uart, cmd.as_bytes(), 2500)?;
     if set.to_ascii_uppercase().contains("ERROR") {
         return Err(format!("module rejected set: {set}"));
     }
-    // Settle before readback — flash write on the module can lag the OK.
     thread::sleep(Duration::from_millis(200));
     let (ver, raw) = read_config(&mut uart)?;
     let (tx, rx) = parse_tx_rx(&raw).ok_or_else(|| {
         format!("program reply unreadable (cannot verify TX/RX): {}", raw.trim())
     })?;
-    if !freq_matches(&tx, &freq) || !freq_matches(&rx, &freq) {
+    let want = normalize_freq(&freqs[0])?;
+    if !freq_matches(&tx, &want) || !freq_matches(&rx, &want) {
         return Err(format!(
-            "module did not take new freq (wanted {freq}, got TX {tx} / RX {rx}). \
-             Check UART wiring; use Read module."
+            "module did not take channel plan (ch1 wanted {want}, got TX {tx} / RX {rx})"
         ));
     }
-
-    let tone_lbl = peltor::ctcss_label(tone);
     Ok(format!(
-        "UART programmed {path}\n  Ch freq {freq} MHz  squelch {sq}  CTCSS {tone_lbl}\n  {ver}\n  channel 1 TX {tx} / RX {rx}"
+        "UART programmed {path}\n  16 Peltor channels  squelch {sq}\n  {ver}\n  plan slot 1 TX {tx} / RX {rx} (live ch via GPIO pins)"
     ))
 }
 
@@ -76,26 +72,32 @@ pub fn read(port: &str) -> Result<String, String> {
 
 fn pick_port(preferred: &str) -> Result<String, String> {
     let want = preferred.trim();
-    if !want.is_empty() && want != "auto" && Path::new(want).exists() {
+    if !want.is_empty() && want != "auto" && Path::new(want).exists() && !is_pi5_debug_uart(want)
+    {
         return Ok(want.to_string());
     }
     for p in PORTS {
-        if Path::new(p).exists() {
+        if Path::new(p).exists() && !is_pi5_debug_uart(p) {
             return Ok(p.to_string());
         }
     }
     Err(
-        "No UART. Wire SA828 TXD→Pi pin 10, RXD→Pi pin 8. Enable serial0 (disable-bt)."
+        "No GPIO UART. On a Pi 5 add dtoverlay=uart0-pi5 and reboot. SA828 TXD→pin 10, RXD→pin 8."
             .into(),
     )
 }
 
-fn set_payload(freq: &str, squelch: u8, ctcss: u8) -> String {
-    let mut pairs = Vec::with_capacity(16);
-    for _ in 0..16 {
-        pairs.push(format!("{freq},{freq}"));
+/// Pi 5 `/dev/serial0` is the debug header (ttyAMA10), not GPIO 14/15.
+fn is_pi5_debug_uart(path: &str) -> bool {
+    if Path::new(path)
+        .file_name()
+        .is_some_and(|n| n == "ttyAMA10")
+    {
+        return true;
     }
-    format!("{},{ctcss:03},{ctcss:03},{squelch}", pairs.join(","))
+    std::fs::read_link(path)
+        .ok()
+        .is_some_and(|t| t.to_string_lossy().contains("ttyAMA10"))
 }
 
 fn open_uart(path: &str) -> Result<Uart, String> {
@@ -160,7 +162,7 @@ fn summarize(raw: &str) -> String {
     match parse_tx_rx(raw) {
         Some((tx, rx)) => {
             let sq = parse_squelch(raw).unwrap_or_else(|| "?".into());
-            format!("channel 1 TX {tx} / RX {rx}  squelch {sq}")
+            format!("plan slot 1 TX {tx} / RX {rx}  squelch {sq}")
         }
         None => raw.trim().to_string(),
     }
@@ -198,7 +200,8 @@ fn freq_matches(got: &str, want: &str) -> bool {
     let Ok(w) = want.trim().replace(',', ".").parse::<f64>() else {
         return false;
     };
-    ((g - w).abs() * 1_000_000.0) <= FREQ_MATCH_HZ
+    // Round so a true 100 Hz gap is not 100.00000003 and rejected.
+    ((g - w).abs() * 1_000_000.0).round() <= FREQ_MATCH_HZ
 }
 
 #[cfg(test)]
@@ -214,8 +217,9 @@ mod tests {
     }
 
     #[test]
-    fn freq_match_within_100hz() {
+    fn freq_match_accepts_module_100hz_step() {
         assert!(freq_matches("446.00625", "446.0062"));
+        assert!(freq_matches("446.0311", "446.0312"));
         assert!(!freq_matches("446.01875", "446.0062"));
     }
 }

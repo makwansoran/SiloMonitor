@@ -64,16 +64,16 @@ fn default_nvr_channel() -> u8 {
     1
 }
 fn default_stream() -> String {
-    "sub".into()
+    "main".into()
 }
 fn default_cam_w() -> u32 {
-    640
+    1280
 }
 fn default_cam_h() -> u32 {
-    480
+    720
 }
 fn default_cam_fps() -> u32 {
-    2
+    10
 }
 
 impl Default for CameraCfg {
@@ -257,6 +257,16 @@ pub struct RadioCfg {
     /// Pi hardware UART: /dev/serial0 (GPIO14 TX / GPIO15 RX).
     #[serde(default = "default_uart_port", alias = "usb_port")]
     pub uart_port: String,
+    /// BCM pins for SA828 channel bits. Pin 4=bit1, 5=bit2, 7=bit4, 6=bit8.
+    /// 0 = that bit is not wired.
+    #[serde(default = "default_ch_bit1")]
+    pub ch_bit1_gpio: u8,
+    #[serde(default = "default_ch_bit2")]
+    pub ch_bit2_gpio: u8,
+    #[serde(default = "default_ch_bit4")]
+    pub ch_bit4_gpio: u8,
+    #[serde(default = "default_ch_bit8")]
+    pub ch_bit8_gpio: u8,
     /// BCM pin wired to SA828 PTT (pin 20). 0 = disable GPIO PTT.
     #[serde(default = "default_ptt_gpio")]
     pub ptt_gpio: u8,
@@ -283,6 +293,10 @@ impl Default for RadioCfg {
             channel: default_channel(),
             squelch: default_squelch(),
             ctcss: 0,
+            ch_bit1_gpio: default_ch_bit1(),
+            ch_bit2_gpio: default_ch_bit2(),
+            ch_bit4_gpio: default_ch_bit4(),
+            ch_bit8_gpio: default_ch_bit8(),
             uart_port: default_uart_port(),
             ptt_gpio: default_ptt_gpio(),
             spken_gpio: 0,
@@ -292,6 +306,19 @@ impl Default for RadioCfg {
             volume_test_file: String::new(),
         }
     }
+}
+
+fn default_ch_bit1() -> u8 {
+    5
+}
+fn default_ch_bit2() -> u8 {
+    6
+}
+fn default_ch_bit4() -> u8 {
+    12
+}
+fn default_ch_bit8() -> u8 {
+    13
 }
 
 fn default_ptt_gpio() -> u8 {

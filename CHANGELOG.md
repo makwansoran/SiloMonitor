@@ -2,6 +2,10 @@
 
 Every change in this pass. Same product: empty-reference match → confirm → SA828 → log.
 
+## Continuous learning
+
+- **alert-feedback** — Home. Under the last-alert image: Empty / Full buttons. Labels the alert into the training set, rebuilds the model, and (on Full) clears a false sticky-empty latch. Full photos are used as negatives so similar frames stop alerting empty.
+
 ## NVR / camera
 
 - **hikvision-config** — `src/config.rs`, `config.yaml`, Config Camera UI, `src/camera.rs`, `DEPLOY_LATER.md`. Easy NVR fields (host, user, password, channel 1–16, sub/main) compose Hikvision `…/Streaming/Channels/<id>`. Optional custom RTSP URL. Password masked in UI; sub-stream default.
@@ -26,9 +30,18 @@ Every change in this pass. Same product: empty-reference match → confirm → S
 
 ## P1
 
-- **vision-honest** — `src/vision.rs`, Model/Stats copy. Match is lighting-normalized. B&W uses the reference threshold, not a new Otsu every frame. Full samples show false-empty risk. No fake “held-out accuracy”.
+- **vision-honest** — `src/vision.rs`, Model/Stats copy. Match is lighting-normalized. B&W uses the reference threshold, not a new Otsu every frame. No fake “held-out accuracy”.
+- **no-full-sample** — Live/Model/Stats/`src/vision.rs`. Dropped Take full sample; empty detection is reference photos + the periodic live check only.
 - **arm-radio-ui** — `src/stats.rs`, Live sidebar. Boot is disarmed until Arm. Pause is remembered. Radio strip shows last TX and the 90s countdown. Reconnect uses the URL on screen.
+- **start-stop** — Live/Config. One Start / Stop for monitoring. Arm, Disarm, Pause, Resume gone. STOPPED replaces DISARMED/PAUSED. Start needs a marked region and empty photos.
+- **live-sidebar-filter** — Live. Mark region / Filter sit in the sidebar, not on the camera. Filter is the old B&W pane.
+- **nav-play-pause** — Top bar. Green play starts monitoring, red pause stops it. Start/Stop pills removed from Live and Config.
+- **live-icon-row** — Live sidebar. Mark region and Filter are small icon buttons on one row (crop / sliders). Clear is a small X when a box exists.
 
 ## P2
 
 - **kiosk-wizard** — Live overlay, windowed (not fullscreen), 10 Hz UI, alert evidence in `data/alerts/`, MUTE badge, honest 24h chart labels, deploy docs for RTSP + ffmpeg.
+- **no-home** — Removed Home. App opens on Live. Pi readings stay in the Live sidebar.
+- **config-full** — Config fills the page (no right sidebar). Bottom terminal stays.
+- **hide-scrollbars** — All pages. Scroll still works; the bar is not drawn.
+- **config-left** — Config. Left sidebar is Configure + Detection / Camera / Radio / App. Detection includes the empty-silo photos.

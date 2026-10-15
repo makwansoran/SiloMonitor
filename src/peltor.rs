@@ -103,6 +103,17 @@ pub fn channel_for_freq(mhz: &str) -> u8 {
     best
 }
 
+/// Logical 8421 channel code for SA828 pins 4/5/7/6 (bits 1/2/4/8).
+/// Channel 16 is code 0000. Pins are driven active-low by `select_channel`.
+pub fn sa828_channel_code(ch: u8) -> u8 {
+    let ch = clamp_channel(ch);
+    if ch == 16 {
+        0
+    } else {
+        ch
+    }
+}
+
 pub fn channel_label(ch: u8) -> String {
     let ch = clamp_channel(ch);
     format!("Ch {ch} — {:.5} MHz", freq_for_channel(ch))
@@ -115,4 +126,17 @@ pub fn ctcss_label(idx: u8) -> String {
     }
     let hz = CTCSS_TONES[(idx - 1) as usize].1;
     format!("{idx} — {hz:.1} Hz")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn channel_codes_match_the_knob() {
+        assert_eq!(sa828_channel_code(1), 0b0001);
+        assert_eq!(sa828_channel_code(3), 0b0011);
+        assert_eq!(sa828_channel_code(6), 0b0110);
+        assert_eq!(sa828_channel_code(16), 0b0000);
+    }
 }

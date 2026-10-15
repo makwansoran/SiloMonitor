@@ -24,7 +24,7 @@ pub struct Stats {
     /// When the silo first looked empty, for the same reason.
     #[serde(default)]
     pub empty_since_unix: Option<u64>,
-    /// Monitoring stays off until the operator arms it.
+    /// Start/Stop. True while monitoring (checks + radio). Old name kept for stats.json.
     #[serde(default)]
     pub armed: bool,
     #[serde(default)]

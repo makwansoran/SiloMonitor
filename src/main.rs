@@ -1,6 +1,7 @@
 mod camera;
 mod config;
 mod eventlog;
+mod host;
 mod peltor;
 mod sa828;
 mod silo_alert;
@@ -12,9 +13,10 @@ use chrono::{Local, TimeZone};
 use config::Config;
 use eframe::egui::{self, Color32, CornerRadius, Pos2, RichText, Sense, Stroke, Vec2};
 use eventlog::EventLog;
+use host::{HostMonitor, HostSnapshot};
 use silo_alert::SiloAlert;
 use stats::Stats;
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::time::{Duration, Instant};
 use supabase::Supabase;
 use vision::{BoxNorm, Reference, SampleAnalysis, SampleMeta};
@@ -24,7 +26,10 @@ const CARD: Color32 = Color32::from_rgb(28, 28, 30);
 const TEXT: Color32 = Color32::from_rgb(245, 245, 247);
 const MUTED: Color32 = Color32::from_rgb(142, 142, 147);
 const BLUE: Color32 = Color32::from_rgb(10, 132, 255);
+const GREEN: Color32 = Color32::from_rgb(48, 209, 88);
 const RED: Color32 = Color32::from_rgb(255, 69, 58);
+/// Fixed width for Config text fields and dropdowns (not full page).
+const CONFIG_FIELD_W: f32 = 280.0;
 const FILL: Color32 = Color32::from_rgb(22, 48, 84);
 const BTN: Color32 = Color32::from_rgb(44, 44, 46);
 const VIDEO_BG: Color32 = Color32::from_rgb(10, 10, 12);
@@ -43,9 +48,7 @@ const LOG_MAX_BYTES: u64 = 2 * 1024 * 1024;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Page {
-    Home,
     Live,
-    Model,
     Stats,
     Config,
 }
@@ -86,9 +89,10 @@ struct App {
     samples: Vec<SampleMeta>,
     sample_idx: Option<usize>,
     sample_tex: Option<egui::TextureHandle>,
+    sample_bw_tex: Option<egui::TextureHandle>,
     sample_view: Option<SampleAnalysis>,
     dataset_dirty: bool,
-    thumb_tex: std::collections::HashMap<String, egui::TextureHandle>,
+    thumb_tex: HashMap<String, egui::TextureHandle>,
     logo_tex: Option<egui::TextureHandle>,
     radio_freq: String,
     cloud: Option<Supabase>,
@@ -118,8 +122,6 @@ struct App {
     warned_no_reference: bool,
     /// Rolling on-disk copy of the terminal, for after-the-fact debugging.
     log_path: std::path::PathBuf,
-    /// Operator must arm after setup. Pause is separate and persisted.
-    armed: bool,
     empty_streak: u32,
     radio_fault: bool,
     last_heartbeat: Option<Instant>,
@@ -127,10 +129,13 @@ struct App {
     /// Last `vcgencmd get_throttled` value. 0 means 5 V has held since boot.
     last_throttled: Option<u32>,
     last_power_daily: Option<Instant>,
+    host: HostMonitor,
     /// Last sparse "silo is full" cloud row.
     last_full_note: Option<Instant>,
     evidence_tex: Option<egui::TextureHandle>,
     evidence_path: Option<std::path::PathBuf>,
+    /// Continuous-learning label on the last alert: `Some(true)` Empty, `Some(false)` Full.
+    evidence_feedback: Option<bool>,
 }
 
 impl App {
@@ -139,15 +144,39 @@ impl App {
         let cfg = Config::load();
         let mut stats = Stats::load();
         let cloud = Supabase::from_cfg(&cfg.supabase);
-        let reference = sync_reference(cloud.as_ref(), Reference::load());
-        stats.labels_empty = vision::list_references().len() as u64;
-        stats.labels_full = vision::list_full_samples().len() as u64;
+        let mut reference = sync_reference(cloud.as_ref(), Reference::load());
+        stats.labels_empty = vision::list_empty_references().len() as u64;
+        stats.labels_full = vision::list_references()
+            .iter()
+            .filter(|s| s.label_empty == Some(false))
+            .count() as u64;
+        // Older reference.json files omit Full negatives — rebuild once so
+        // continuous-learning Full photos start rejecting false empties.
+        if let Some(r) = &reference {
+            if stats.labels_full > 0 && r.negatives.is_empty() {
+                if let Ok(built) = vision::build_reference() {
+                    if let Some(c) = &cloud {
+                        if let Ok(bytes) = serde_json::to_vec(&built) {
+                            c.upload_bytes(&c.reference_path(), bytes, "application/json");
+                        }
+                    }
+                    reference = Some(built);
+                }
+            }
+        }
         if reference.is_none() {
             stats.last_train_unix = None;
             stats.last_train_accuracy = None;
         }
         silo_alert::set_ptt_pin(cfg.radio.ptt_gpio);
         silo_alert::set_spken_pin(cfg.radio.spken_gpio);
+        silo_alert::set_channel_pins(
+            cfg.radio.ch_bit1_gpio,
+            cfg.radio.ch_bit2_gpio,
+            cfg.radio.ch_bit4_gpio,
+            cfg.radio.ch_bit8_gpio,
+        );
+        let _ = silo_alert::select_channel(cfg.radio.channel);
         silo_alert::set_audio_device(&cfg.radio.audio_device);
         silo_alert::set_muted(cfg.radio.muted);
         let mut alert = SiloAlert::new();
@@ -168,16 +197,20 @@ impl App {
                 Ok(_) => eprintln!("supabase: no remote alerts yet"),
                 Err(e) => eprintln!("supabase: pull {e}"),
             }
+            sb.backfill_empty_image_paths();
         } else {
             eprintln!("supabase: disabled (set supabase.enabled + key, or SUPABASE_KEY)");
         }
         let resume_empty = stats.empty_state;
         let resume_empty_since = stats.empty_since_unix;
-        let armed = stats.armed;
-        let monitor = !stats.monitor_paused;
+        // Old files had Arm + Pause. One flag now: running only if it was armed and not paused.
+        let monitor = stats.armed && !stats.monitor_paused;
+        stats.armed = monitor;
+        stats.monitor_paused = !monitor;
         let radio_fault = !stats.last_radio_ok && stats.last_radio_err.is_some();
         if let Some(ref sb) = cloud {
             sb.push_event("app_start", Some(resume_empty), None);
+            sb.sync_all_reference_images();
         }
         // Channel is source of truth; heal frequency from nearest Peltor ch.
         let mut cfg = cfg;
@@ -188,6 +221,8 @@ impl App {
         cfg.radio.frequency_mhz = peltor::sa828_freq_for_channel(cfg.radio.channel);
         cfg.radio.ctcss = peltor::clamp_ctcss(cfg.radio.ctcss);
         let radio_freq = cfg.radio.frequency_mhz.clone();
+        let host = HostMonitor::new();
+        let last_throttled = host.snapshot().and_then(|s| s.throttled);
         Self {
             cam,
             live_tex: None,
@@ -197,7 +232,7 @@ impl App {
             alert: Some(alert),
             stats,
             monitor,
-            page: Page::Home,
+            page: Page::Live,
             events: EventLog::open(log_path),
             empty_alerts,
             empty_since: resume_empty_since,
@@ -208,9 +243,10 @@ impl App {
             samples: vision::list_references(),
             sample_idx: None,
             sample_tex: None,
+            sample_bw_tex: None,
             sample_view: None,
             dataset_dirty: false,
-            thumb_tex: std::collections::HashMap::new(),
+            thumb_tex: HashMap::new(),
             logo_tex: None,
             radio_freq,
             cloud,
@@ -232,16 +268,17 @@ impl App {
             box_drag_now: None,
             warned_no_reference: false,
             log_path: text_log,
-            armed,
             empty_streak: 0,
             radio_fault,
             last_heartbeat: None,
             last_log_purge: None,
-            last_throttled: read_throttled(),
+            last_throttled,
             last_power_daily: None,
+            host,
             last_full_note: None,
             evidence_tex: None,
             evidence_path: vision::latest_alert_evidence(),
+            evidence_feedback: vision::latest_alert_feedback(),
         }
     }
 
@@ -271,6 +308,7 @@ impl App {
         self.pull_frame(None);
         self.tick_heartbeat();
         self.maybe_daily_power();
+        self.tick_host();
     }
     /// Grab a frame and run the scheduled check. The picture is optional;
     /// headless mode passes no context and still compares and alerts.
@@ -425,7 +463,7 @@ impl App {
                     .rect_filled(grip, CornerRadius::same(2), HAIRLINE);
 
                 ui.add_space(12.0);
-                egui::ScrollArea::vertical()
+                scroll_y()
                     .auto_shrink([false, false])
                     .stick_to_bottom(true)
                     .show(ui, |ui| {
@@ -489,7 +527,7 @@ impl App {
         field_label(
             ui,
             "Match threshold",
-            "How closely the frame must match empty photos. Auto uses cohesion from your reference set; full samples can raise the effective line.",
+            "How closely the frame must match empty photos. Auto uses cohesion from your reference set.",
         );
         let base_suggested = self
             .reference
@@ -503,7 +541,12 @@ impl App {
             effective * 100.0
         };
         if ui
-            .add(egui::Slider::new(&mut pct, 70.0..=99.5).suffix(" %"))
+            .allocate_ui_with_layout(
+                Vec2::new(CONFIG_FIELD_W, ui.spacing().interact_size.y),
+                egui::Layout::left_to_right(egui::Align::Center),
+                |ui| ui.add(egui::Slider::new(&mut pct, 70.0..=99.5).suffix(" %")),
+            )
+            .inner
             .changed()
         {
             self.cfg.level.empty_match_threshold = pct / 100.0;
@@ -521,14 +564,6 @@ impl App {
             ui.label(RichText::new(warn).size(11.0).color(RED));
             ui.add_space(4.0);
         }
-        if let Some(warn) = self
-            .reference
-            .as_ref()
-            .and_then(|r| vision::full_sample_warning(r, self.base_match_threshold()))
-        {
-            ui.label(RichText::new(warn).size(11.0).color(RED));
-            ui.add_space(4.0);
-        }
         if self.cfg.level.empty_match_threshold > 0.0 {
             if quiet_btn(ui, "Auto").clicked() {
                 self.cfg.level.empty_match_threshold = 0.0;
@@ -539,7 +574,7 @@ impl App {
         field_label(
             ui,
             "Reference",
-            "Built from empty-silo photos on Live. Rebuild after changing the watched region.",
+            "Built from empty-silo photos on Home. Rebuild after changing the watched region.",
         );
         ui.add_space(6.0);
         match self.reference.as_ref() {
@@ -563,7 +598,7 @@ impl App {
             }
             None => {
                 ui.label(
-                    RichText::new("No reference yet — add photos on Live.")
+                    RichText::new("No reference yet — add photos on Home.")
                         .size(12.0)
                         .color(RED),
                 );
@@ -578,7 +613,136 @@ impl App {
             );
         }
         ui.add_space(10.0);
-        if pill(ui, "Rebuild reference").clicked() {
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 8.0;
+            if config_action_btn(ui, "Rebuild reference", false).clicked() {
+                self.rebuild_reference();
+            }
+            if config_action_btn(ui, "Sync photos to cloud", false)
+                .on_hover_text("Upload every Empty / Not empty photo + metadata to Supabase.")
+                .clicked()
+            {
+                if let Some(cloud) = &self.cloud {
+                    cloud.sync_all_reference_images();
+                    self.note = "Syncing reference photos to Supabase…".into();
+                } else {
+                    self.note = "Supabase is not configured".into();
+                }
+            }
+        });
+
+        ui.add_space(16.0);
+        field_label(
+            ui,
+            "Reference photos",
+            "Home Empty/Full feedback on the last alert lands here. Click a photo to enlarge it. Only Empty photos build the match set; Full photos reject false empties.",
+        );
+        ui.add_space(8.0);
+        let ctx = ui.ctx().clone();
+        self.draw_library_grid(ui, &ctx);
+        self.draw_selected_reference(ui);
+    }
+
+    /// Large colour + B&W preview for the photo selected in Config → Detection.
+    fn draw_selected_reference(&mut self, ui: &mut egui::Ui) {
+        let Some(i) = self.sample_idx.filter(|i| *i < self.samples.len()) else {
+            return;
+        };
+        if self.sample_view.is_none() {
+            return;
+        }
+        let meta = self.samples[i].clone();
+        let n = self.samples.len();
+        let num = i + 1;
+        let taken = fmt_ms(meta.captured_ms);
+        let is_empty = meta.label_empty != Some(false);
+        let kind = if is_empty { "Empty" } else { "Not empty" };
+        let (match_txt, size_txt) = {
+            let view = self.sample_view.as_ref().unwrap();
+            (
+                view.match_score
+                    .map(|m| format!("{:.0}%", m * 100.0))
+                    .unwrap_or_else(|| "—".into()),
+                format!("{}×{}", view.width, view.height),
+            )
+        };
+        let empty_n = self
+            .samples
+            .iter()
+            .filter(|s| s.label_empty != Some(false))
+            .count();
+        let full_n = n.saturating_sub(empty_n);
+
+        ui.add_space(16.0);
+        ui.horizontal(|ui| {
+            ui.label(
+                RichText::new(format!("Selected  ·  #{num} of {n}"))
+                    .size(14.0)
+                    .color(TEXT)
+                    .strong(),
+            );
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if quiet_btn(ui, "Close").clicked() {
+                    self.sample_idx = None;
+                    self.sample_view = None;
+                    self.sample_tex = None;
+                    self.sample_bw_tex = None;
+                }
+            });
+        });
+        ui.add_space(6.0);
+        row_stat(ui, "Label", kind);
+        row_stat(ui, "Taken", &taken);
+        row_stat(ui, "Size", &size_txt);
+        row_stat(ui, "Disk", &format_bytes(meta.bytes));
+        row_stat(ui, "Match to empty set", &match_txt);
+        row_stat(ui, "Library", &format!("{empty_n} empty  ·  {full_n} not empty"));
+
+        ui.add_space(8.0);
+        field_label(
+            ui,
+            "Silo state",
+            "Empty = used for detection. Not empty = kept for reference only.",
+        );
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 8.0;
+            let empty_btn = egui::Button::new(
+                RichText::new("Empty")
+                    .size(14.0)
+                    .color(if is_empty { TEXT } else { MUTED }),
+            )
+            .min_size(Vec2::new(120.0, 36.0))
+            .fill(if is_empty { GREEN } else { BTN });
+            let full_btn = egui::Button::new(
+                RichText::new("Not empty")
+                    .size(14.0)
+                    .color(if !is_empty { TEXT } else { MUTED }),
+            )
+            .min_size(Vec2::new(120.0, 36.0))
+            .fill(if !is_empty { RED } else { BTN });
+            if ui.add(empty_btn).clicked() && !is_empty {
+                self.set_selected_empty(true);
+            }
+            if ui.add(full_btn).clicked() && is_empty {
+                self.set_selected_empty(false);
+            }
+        });
+
+        ui.add_space(10.0);
+        let avail_w = ui.available_width().max(200.0);
+        let pane_w = ((avail_w - 12.0) * 0.5).clamp(160.0, 520.0);
+        let pane_h = (pane_w * 0.75).clamp(140.0, 400.0);
+        let colour = self.sample_tex.clone();
+        let bw = self.sample_bw_tex.clone();
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 12.0;
+            draw_preview_pane(ui, colour.as_ref(), "Colour", pane_w, pane_h);
+            draw_preview_pane(ui, bw.as_ref(), "B&W filter", pane_w, pane_h);
+        });
+
+        ui.add_space(10.0);
+        if quiet_btn(ui, "Delete photo").clicked() {
+            self.delete_selected();
             self.rebuild_reference();
         }
     }
@@ -592,54 +756,110 @@ impl App {
             "NVR host",
             "LAN IP or hostname of the Hikvision NVR (not each camera).",
         );
-        ui.add(
-            egui::TextEdit::singleline(&mut self.cfg.camera.host)
-                .desired_width(ui.available_width())
-                .hint_text("192.168.1.64"),
-        );
+        config_text_field(ui, "nvr_host", &mut self.cfg.camera.host, "192.168.1.64", false);
 
         ui.add_space(8.0);
         field_label(ui, "RTSP port", "Usually 554. Confirm in the NVR network settings.");
         {
-            let mut port = self.cfg.camera.rtsp_port as f32;
-            ui.add(egui::DragValue::new(&mut port).range(1.0..=65535.0).speed(1));
-            self.cfg.camera.rtsp_port = port as u16;
+            let buf_id = egui::Id::new("nvr_rtsp_port_buf");
+            let mut port = ui.data_mut(|d| {
+                d.get_temp_mut_or_insert_with(buf_id, || self.cfg.camera.rtsp_port.to_string())
+                    .clone()
+            });
+            let resp = config_text_field(ui, "nvr_rtsp_port", &mut port, "554", false);
+            if resp.changed() {
+                ui.data_mut(|d| d.insert_temp(buf_id, port.clone()));
+                if let Ok(p) = port.trim().parse::<u16>() {
+                    if p > 0 {
+                        self.cfg.camera.rtsp_port = p;
+                    }
+                }
+            } else if !resp.has_focus() {
+                let synced = self.cfg.camera.rtsp_port.to_string();
+                ui.data_mut(|d| d.insert_temp(buf_id, synced));
+            }
         }
 
         ui.add_space(8.0);
         field_label(ui, "Username", "Prefer a view-only NVR user (not admin).");
-        ui.add(
-            egui::TextEdit::singleline(&mut self.cfg.camera.username)
-                .desired_width(ui.available_width())
-                .hint_text("viewer"),
-        );
+        config_text_field(ui, "nvr_user", &mut self.cfg.camera.username, "viewer", false);
 
         ui.add_space(8.0);
         field_label(ui, "Password", "Stored only in local config on this Pi — not committed to git.");
-        ui.add(
-            egui::TextEdit::singleline(&mut self.cfg.camera.password)
-                .desired_width(ui.available_width())
-                .password(true)
-                .hint_text("••••••••"),
-        );
+        config_text_field(ui, "nvr_pass", &mut self.cfg.camera.password, "••••••••", true);
 
         ui.add_space(10.0);
         field_label(
             ui,
-            "Channel",
-            "NVR camera number 1–16 for the silo. Sub-stream ID = channel×100+2 (e.g. 3 → 302).",
+            "Camera feed",
+            "Which NVR camera to watch (1–16). Your plant has live feeds on 1–14. Save reconnects to the chosen feed.",
         );
-        ui.horizontal(|ui| {
-            let mut ch = self.cfg.camera.channel as f32;
-            ui.add(egui::Slider::new(&mut ch, 1.0..=16.0).integer().suffix(" / 16"));
-            self.cfg.camera.channel = ch as u8;
+        {
+            let mut ch = self.cfg.camera.channel.clamp(1, 16);
+            let label = format!(
+                "Camera {ch}  ·  stream {}",
+                self.cfg.camera.hikvision_channel_id()
+            );
+            egui::ComboBox::from_id_salt("nvr_camera_feed")
+                .width(CONFIG_FIELD_W)
+                .selected_text(label)
+                .show_ui(ui, |ui| {
+                    for c in 1u8..=16 {
+                        let stream_id = {
+                            let suffix = if self.cfg.camera.stream.eq_ignore_ascii_case("main") {
+                                1
+                            } else {
+                                2
+                            };
+                            c as u32 * 100 + suffix
+                        };
+                        ui.selectable_value(
+                            &mut ch,
+                            c,
+                            format!("Camera {c}  (Channels/{stream_id})"),
+                        );
+                    }
+                });
+            self.cfg.camera.channel = ch;
+        }
+        ui.add_space(6.0);
+        ui.horizontal_wrapped(|ui| {
+            ui.spacing_mut().item_spacing = Vec2::new(6.0, 6.0);
+            let current = self.cfg.camera.channel.clamp(1, 16);
+            for c in 1u8..=16 {
+                let selected = c == current;
+                let btn = egui::Button::new(
+                    RichText::new(format!("{c}"))
+                        .size(14.0)
+                        .color(TEXT),
+                )
+                .min_size(Vec2::new(36.0, 32.0))
+                .fill(if selected { BLUE } else { BTN })
+                .stroke(egui::Stroke::new(
+                    1.0_f32,
+                    if selected { BLUE } else { HAIRLINE },
+                ));
+                if ui.add(btn).on_hover_text(format!("Camera {c}")).clicked() {
+                    self.cfg.camera.channel = c;
+                }
+            }
         });
+        ui.add_space(4.0);
+        row_stat(
+            ui,
+            "Selected",
+            &format!(
+                "Camera {} → Channels/{}",
+                self.cfg.camera.channel.clamp(1, 16),
+                self.cfg.camera.hikvision_channel_id()
+            ),
+        );
 
         ui.add_space(8.0);
         field_label(
             ui,
             "Stream",
-            "Sub (…02) is low-res — preferred on the Pi. Main (…01) is high-res.",
+            "Main (…01) is HD from the NVR. Sub (…02) is low-res if the Pi needs less load.",
         );
         ui.horizontal(|ui| {
             let is_sub = !self.cfg.camera.stream.eq_ignore_ascii_case("main");
@@ -669,10 +889,12 @@ impl App {
             .on_hover_text("Override Hikvision URL builder with a full rtsp:// address.");
         if self.cfg.camera.use_custom_url {
             ui.add_space(4.0);
-            ui.add(
-                egui::TextEdit::singleline(&mut self.cfg.camera.rtsp_url)
-                    .desired_width(ui.available_width())
-                    .hint_text("rtsp://user:pass@host:554/Streaming/Channels/102"),
+            config_text_field(
+                ui,
+                "nvr_custom_url",
+                &mut self.cfg.camera.rtsp_url,
+                "rtsp://user:pass@host:554/Streaming/Channels/102",
+                false,
             );
         }
 
@@ -680,7 +902,7 @@ impl App {
         field_label(
             ui,
             "Resolution",
-            "Decode size after ffmpeg scale. Keep modest for Pi CPU.",
+            "Decode size after ffmpeg scale. 1280×720 is a good HD default; main stream source is up to 2560×1440.",
         );
         ui.horizontal(|ui| {
             let mut w = self.cfg.camera.width as f32;
@@ -697,9 +919,15 @@ impl App {
         field_label(
             ui,
             "Decode rate",
-            "Frames per second from ffmpeg. Low is fine — detection only runs each check interval.",
+            "Live-view frames per second from ffmpeg. NVR source is ~40 fps; 10 is smooth on the Pi. Detection still runs on its own interval.",
         );
-        ui.add(egui::Slider::new(&mut fps, 1.0..=15.0).integer().suffix(" fps"));
+        ui.allocate_ui_with_layout(
+            Vec2::new(CONFIG_FIELD_W, ui.spacing().interact_size.y),
+            egui::Layout::left_to_right(egui::Align::Center),
+            |ui| {
+                ui.add(egui::Slider::new(&mut fps, 1.0..=25.0).integer().suffix(" fps"));
+            },
+        );
         self.cfg.camera.fps = fps as u32;
 
         ui.add_space(14.0);
@@ -721,14 +949,6 @@ impl App {
             "Channel id",
             &self.cfg.camera.hikvision_channel_id().to_string(),
         );
-
-        ui.add_space(12.0);
-        if pill(ui, "Reconnect camera")
-            .on_hover_text("Restart ffmpeg against the current host / URL settings.")
-            .clicked()
-        {
-            self.reconnect_camera();
-        }
     }
 
     /// SA828 intercom settings matched to the Peltor LiteCom Pro III headset.
@@ -742,11 +962,11 @@ impl App {
         field_label(
             ui,
             "Channel",
-            "Peltor analog PMR446 channel 1–16. Programs the SA828 over UART; kept only if TX/RX readback matches. Digital DMR on the headset is not used.",
+            "Peltor analog PMR446 channel 1–16. Drives SA828 pins 4, 5, 7 and 6 active-low (same as the channel knob). UART only stores the 16-slot plan. Digital DMR is not used.",
         );
         let mut ch = self.cfg.radio.channel;
         egui::ComboBox::from_id_salt("peltor_channel")
-            .width(ui.available_width())
+            .width(CONFIG_FIELD_W)
             .selected_text(peltor::channel_label(ch))
             .show_ui(ui, |ui| {
                 for &(c, _) in &peltor::ANALOG_CHANNELS {
@@ -754,14 +974,18 @@ impl App {
                 }
             });
         if ch != self.cfg.radio.channel {
-            let prev_ch = self.cfg.radio.channel;
-            let prev_freq = self.cfg.radio.frequency_mhz.clone();
             self.cfg.radio.channel = ch;
             self.apply_peltor_channel();
-            if !self.program_sender() {
-                self.cfg.radio.channel = prev_ch;
-                self.cfg.radio.frequency_mhz = prev_freq.clone();
-                self.radio_freq = prev_freq;
+            let _ = self.cfg.save();
+            match silo_alert::select_channel(ch) {
+                Ok(()) => {
+                    self.term_radio(&format!("Ch {ch} selected"));
+                    self.note.clear();
+                }
+                Err(e) => {
+                    self.term_radio(&e);
+                    self.note = e;
+                }
             }
         }
         ui.add_space(4.0);
@@ -775,7 +999,13 @@ impl App {
                 "Squelch",
                 "0 = open (hiss). 1 = normal. Higher = quieter until a strong signal.",
             );
-            let sq_resp = ui.add(egui::Slider::new(&mut sq, 0.0..=8.0).integer());
+            let sq_resp = ui
+                .allocate_ui_with_layout(
+                    Vec2::new(CONFIG_FIELD_W, ui.spacing().interact_size.y),
+                    egui::Layout::left_to_right(egui::Align::Center),
+                    |ui| ui.add(egui::Slider::new(&mut sq, 0.0..=8.0).integer()),
+                )
+                .inner;
             let new_sq = sq as u8;
             if new_sq != self.cfg.radio.squelch {
                 self.cfg.radio.squelch = new_sq;
@@ -794,7 +1024,7 @@ impl App {
             "Privacy tone. Must match the headset if it uses CTCSS. Off = 0.",
         );
         egui::ComboBox::from_id_salt("peltor_ctcss")
-            .width(ui.available_width())
+            .width(CONFIG_FIELD_W)
             .selected_text(peltor::ctcss_label(self.cfg.radio.ctcss))
             .show_ui(ui, |ui| {
                 ui.selectable_value(&mut self.cfg.radio.ctcss, 0, "Off");
@@ -813,13 +1043,9 @@ impl App {
         field_label(
             ui,
             "UART port",
-            "Serial device for Program / Read (usually /dev/serial0 on Pi GPIO14/15).",
+            "Serial device for Program / Read. Pi 5 GPIO 14/15 is /dev/ttyAMA0 (not /dev/serial0).",
         );
-        ui.add(
-            egui::TextEdit::singleline(&mut self.cfg.radio.uart_port)
-                .desired_width(ui.available_width())
-                .hint_text("/dev/serial0"),
-        );
+        config_text_field(ui, "radio_uart", &mut self.cfg.radio.uart_port, "/dev/serial0", false);
         ui.add_space(10.0);
         {
             let mut ptt = self.cfg.radio.ptt_gpio as f32;
@@ -828,7 +1054,13 @@ impl App {
                 "PTT GPIO",
                 "BCM pin to SA828 PTT (pin 20). 0 = off. LOW = TX, idle = High-Z (never drive 3.3 V).",
             );
-            ui.add(egui::Slider::new(&mut ptt, 0.0..=27.0).integer());
+            ui.allocate_ui_with_layout(
+                Vec2::new(CONFIG_FIELD_W, ui.spacing().interact_size.y),
+                egui::Layout::left_to_right(egui::Align::Center),
+                |ui| {
+                    ui.add(egui::Slider::new(&mut ptt, 0.0..=27.0).integer());
+                },
+            );
             self.cfg.radio.ptt_gpio = ptt as u8;
             silo_alert::set_ptt_pin(self.cfg.radio.ptt_gpio);
         }
@@ -840,19 +1072,20 @@ impl App {
                 "SPKEN GPIO",
                 "Optional. SA828 SPKEN (pin 9) → this BCM pin. High = channel busy; waits before TX. 0 = off. Use 3.3 V module supply or a level shifter.",
             );
-            ui.add(egui::Slider::new(&mut spk, 0.0..=27.0).integer());
+            ui.allocate_ui_with_layout(
+                Vec2::new(CONFIG_FIELD_W, ui.spacing().interact_size.y),
+                egui::Layout::left_to_right(egui::Align::Center),
+                |ui| {
+                    ui.add(egui::Slider::new(&mut spk, 0.0..=27.0).integer());
+                },
+            );
             let new_spk = spk as u8;
             if new_spk != self.cfg.radio.spken_gpio {
                 self.cfg.radio.spken_gpio = new_spk;
                 silo_alert::set_spken_pin(new_spk);
             }
             ui.add_space(4.0);
-            let ch_status = match silo_alert::channel_busy() {
-                Some(true) => "BUSY",
-                Some(false) => "FREE",
-                None => "off",
-            };
-            row_stat(ui, "Channel", ch_status);
+            line_lamp(ui);
         }
         ui.add_space(10.0);
         field_label(
@@ -860,10 +1093,12 @@ impl App {
             "Audio device",
             "ALSA device for the voice clip (3.5 mm → MIC). Volume is set on the Pi system, not by the app.",
         );
-        ui.add(
-            egui::TextEdit::singleline(&mut self.cfg.radio.audio_device)
-                .desired_width(ui.available_width())
-                .hint_text("plughw:CARD=Headphones,DEV=0"),
+        config_text_field(
+            ui,
+            "radio_audio",
+            &mut self.cfg.radio.audio_device,
+            "plughw:CARD=Headphones,DEV=0",
+            false,
         );
         ui.add_space(10.0);
         if ui
@@ -907,7 +1142,7 @@ impl App {
                     "Only used by Test radio. Empty alerts still use the normal production clip.",
                 );
                 egui::ComboBox::from_id_salt("volume_test_clip")
-                    .width(ui.available_width())
+                    .width(CONFIG_FIELD_W)
                     .selected_text(current_label)
                     .show_ui(ui, |ui| {
                         for (file, label) in &clips {
@@ -934,28 +1169,15 @@ impl App {
         );
 
         ui.add_space(12.0);
-        if pill(ui, "Program module")
-            .on_hover_text(
-                "Write the selected channel frequency to all 16 SA828 memories. Also runs when you change Channel / CTCSS / Squelch.",
-            )
-            .clicked()
-        {
-            self.program_sender();
-        }
-        ui.add_space(8.0);
-        if pill(ui, "Read module")
-            .on_hover_text("Read current TX/RX frequency from the SA828 over UART.")
-            .clicked()
-        {
-            self.read_radio();
-        }
-        ui.add_space(8.0);
         let test_tip = if self.cfg.radio.volume_test_mode {
             "PTT LOW → play selected volume-test WAV → High-Z idle."
         } else {
             "PTT LOW → play production WAV once → High-Z idle."
         };
-        if pill(ui, "Test radio").on_hover_text(test_tip).clicked() {
+        if config_action_btn(ui, "Test radio", false)
+            .on_hover_text(test_tip)
+            .clicked()
+        {
             self.test_radio();
         }
     }
@@ -975,16 +1197,12 @@ impl App {
             "Site ID",
             "Identity for Supabase events and stills (e.g. spectr-pi).",
         );
-        ui.add(
-            egui::TextEdit::singleline(&mut self.cfg.supabase.site_id)
-                .desired_width(ui.available_width())
-                .hint_text("spectr-pi"),
-        );
+        config_text_field(ui, "supabase_site", &mut self.cfg.supabase.site_id, "spectr-pi", false);
         ui.add_space(12.0);
 
         ui.checkbox(&mut self.cfg.supabase.enabled, "Send events to Supabase")
             .on_hover_text(
-                "Each fact has its own Supabase table. Stills → silo-frames/{site}/latest.jpg. Offline rows stay queued.",
+                "Empty alerts → silo_empty (ts + image_path). Stills → silo-frames/{site}/alerts/{unix}.jpg. Offline rows stay queued.",
             );
         ui.add_space(10.0);
         row_stat(ui, "Cloud", &cloud_status(self.cloud.is_some()));
@@ -1022,11 +1240,6 @@ impl App {
         ui.add_space(6.0);
         row_stat(ui, "Log", &self.log_path.display().to_string());
         row_stat(ui, "Images", &self.samples.len().to_string());
-        ui.add_space(10.0);
-        let monitoring = if self.monitor { "Pause monitoring" } else { "Resume monitoring" };
-        if pill(ui, monitoring).clicked() {
-            self.set_paused(self.monitor);
-        }
     }
 
     /// Stats sidebar: the numbers, with the charts in the main area.
@@ -1046,13 +1259,7 @@ impl App {
         row_stat(
             ui,
             "Monitoring",
-            if !self.armed {
-                "Disarmed"
-            } else if self.monitor {
-                "Running"
-            } else {
-                "Paused"
-            },
+            if self.monitor { "Running" } else { "Stopped" },
         );
         row_stat(
             ui,
@@ -1105,7 +1312,6 @@ impl App {
         ui.label(RichText::new("Reference").size(12.0).color(MUTED));
         ui.add_space(8.0);
         row_stat(ui, "Empty photos", &self.stats.labels_empty.to_string());
-        row_stat(ui, "Full samples", &self.stats.labels_full.to_string());
         row_stat(
             ui,
             "Photos agree",
@@ -1128,17 +1334,6 @@ impl App {
                 .map(fmt_dt)
                 .unwrap_or_else(|| "Never".into()),
         );
-        if let Some(risk) = self.false_empty_risk() {
-            row_stat(ui, "False-empty risk", &risk);
-        }
-        if let Some(warn) = self
-            .reference
-            .as_ref()
-            .and_then(|r| vision::full_sample_warning(r, self.base_match_threshold()))
-        {
-            ui.add_space(4.0);
-            ui.label(RichText::new(warn).size(11.0).color(RED));
-        }
 
         ui.add_space(16.0);
         ui.label(RichText::new("Cloud").size(12.0).color(MUTED));
@@ -1178,6 +1373,80 @@ impl App {
         }
     }
 
+    fn config_main(&mut self, ui: &mut egui::Ui) {
+        egui::Frame::new()
+            .fill(CARD)
+            .corner_radius(16)
+            .inner_margin(egui::Margin::same(24))
+            .show(ui, |ui| {
+                ui.set_min_size(ui.available_size());
+                scroll_y()
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        match self.config_tab {
+                            ConfigTab::Detection => self.config_detection(ui),
+                            ConfigTab::Camera => self.config_camera(ui),
+                            ConfigTab::Radio => self.config_radio(ui),
+                            ConfigTab::App => self.config_app(ui),
+                        }
+
+                        ui.add_space(18.0);
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing.x = 8.0;
+                            let save_tip = if self.config_tab == ConfigTab::Radio {
+                                "Save settings, program the SA828, and read it back."
+                            } else {
+                                "Write settings to config.yaml."
+                            };
+                            if config_action_btn(ui, "Save", true)
+                                .on_hover_text(save_tip)
+                                .clicked()
+                            {
+                                let camera_tab = self.config_tab == ConfigTab::Camera;
+                                self.save_config();
+                                if camera_tab {
+                                    self.reconnect_camera();
+                                    if self.note.starts_with("Saved") || self.note.is_empty() {
+                                        self.note = format!(
+                                            "Saved — watching Camera {}",
+                                            self.cfg.camera.channel.clamp(1, 16)
+                                        );
+                                    }
+                                }
+                            }
+                            if self.config_tab == ConfigTab::Camera
+                                && config_action_btn(ui, "Reconnect camera", false)
+                                    .on_hover_text(
+                                        "Restart ffmpeg against the current host / URL settings.",
+                                    )
+                                    .clicked()
+                            {
+                                self.reconnect_camera();
+                            }
+                        });
+                        ui.add_space(10.0);
+                        note_line(ui, &self.note);
+                        ui.add_space(8.0);
+                    });
+            });
+    }
+
+    fn config_sidebar(&mut self, ui: &mut egui::Ui) {
+        ui.label(RichText::new("Configure").size(22.0).color(TEXT).strong());
+        ui.add_space(12.0);
+        ui.spacing_mut().item_spacing.y = 6.0;
+        for (t, label) in [
+            (ConfigTab::Detection, "Detection"),
+            (ConfigTab::Camera, "Camera"),
+            (ConfigTab::Radio, "Radio"),
+            (ConfigTab::App, "App"),
+        ] {
+            if config_tab_btn(ui, label, self.config_tab == t).clicked() {
+                self.config_tab = t;
+            }
+        }
+    }
+
     /// Stats main area: alert history plus the most recent alerts.
     fn stats_main(&mut self, ui: &mut egui::Ui) {
         self.refresh_from_cloud();
@@ -1190,7 +1459,7 @@ impl App {
             .inner_margin(egui::Margin::same(18))
             .show(ui, |ui| {
                 ui.set_min_size(ui.available_size());
-                egui::ScrollArea::vertical()
+                scroll_y()
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
                         ui.label(
@@ -1284,6 +1553,17 @@ impl App {
         format!("{}  {prefix}", now.format("%H:%M:%S"))
     }
 
+    /// Multi-line radio / UART status → bottom terminal (not the Save note).
+    fn term_radio(&mut self, msg: &str) {
+        for line in msg.lines() {
+            let line = line.trim_end();
+            if line.is_empty() {
+                continue;
+            }
+            self.term_line(Self::term_now(&format!("radio  {line}")));
+        }
+    }
+
     /// One Live cycle: model decides empty/full from training only (no human confirm).
     fn run_check(&mut self, w: u32, h: u32, rgb: &[u8]) {
         self.last_check_at = Some(Instant::now());
@@ -1309,14 +1589,19 @@ impl App {
         let feat = vision::features_in_roi(w, h, rgb, roi);
         let feat_bw = vision::bw_features(w, h, rgb, roi, Some(reference.bw_threshold));
         let score = reference.similarity_pair(&feat, &feat_bw);
+        let neg = reference.negative_similarity_pair(&feat, &feat_bw);
         self.last_match = Some(score);
 
         let threshold = self.match_threshold();
         // Enter empty at `threshold`; leave only clearly below it (hysteresis)
         // so flicker on the line cannot clear the radio latch in one frame.
+        // Full feedback photos (negatives) must not look closer than empty.
         const CLEAR_HYSTERESIS: f32 = 0.03;
-        let looks_empty = score >= threshold;
-        let looks_full = score < (threshold - CLEAR_HYSTERESIS).max(0.0);
+        const NEG_MARGIN: f32 = 0.02;
+        let closer_to_full = !reference.negatives.is_empty() && neg + NEG_MARGIN >= score;
+        let looks_empty = score >= threshold && !closer_to_full;
+        let looks_full =
+            score < (threshold - CLEAR_HYSTERESIS).max(0.0) || closer_to_full;
 
         let unix = eventlog::now_unix();
         let interval = self.cfg.level.check_interval_seconds.max(1.0);
@@ -1359,8 +1644,8 @@ impl App {
         let filled_confirmed =
             looks_full && filled_long_enough && self.full_streak >= need_streak;
 
-        let just_confirmed = self.armed && confirmed && !self.empty;
-        let just_filled = self.armed && filled_confirmed && self.empty;
+        let just_confirmed = self.monitor && confirmed && !self.empty;
+        let just_filled = self.monitor && filled_confirmed && self.empty;
 
         let mut alerted = false;
         if just_confirmed {
@@ -1377,6 +1662,7 @@ impl App {
             {
                 self.evidence_path = Some(path);
                 self.evidence_tex = None;
+                self.evidence_feedback = None;
             }
             // TX only on this edge — never on every check while still empty.
             if let Some(alert) = &mut self.alert {
@@ -1471,8 +1757,6 @@ impl App {
                 egui::FontId::proportional(10.0),
                 MUTED,
             );
-            // Controls sit on the feed itself, bottom-right.
-            let controls = self.live_controls(ui, rect);
 
             if let Some(tex) = self.live_tex.as_ref() {
                 let body = egui::Rect::from_min_max(
@@ -1486,11 +1770,17 @@ impl App {
                 let uv =
                     egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
                 ui.painter().image(tex.id(), img, uv, Color32::WHITE);
-                // A press on a control must not start drawing a box.
-                if !controls {
-                    self.handle_region_drag(ui, &resp, img);
-                }
+                self.handle_region_drag(ui, &resp, img);
                 self.draw_region_overlay(ui, img);
+            }
+            if self.marking_region {
+                ui.painter().text(
+                    Pos2::new(rect.left() + 12.0, rect.bottom() - 16.0),
+                    egui::Align2::LEFT_BOTTOM,
+                    "Drag a box on the view",
+                    egui::FontId::proportional(12.0),
+                    BLUE,
+                );
             }
 
             if !split {
@@ -1501,102 +1791,24 @@ impl App {
             pane_with_caption(
                 ui,
                 pane,
-                "BLACK & WHITE",
+                "FILTER",
                 self.model_tex.as_ref(),
-                "mark a region",
+                "no frame yet",
             );
         });
     }
 
-    /// Mark / Clear / B&W laid over the bottom-right of the feed.
-    /// Returns true while the pointer is on one of them, so the region drag
-    /// can stand down.
-    fn live_controls(&mut self, ui: &mut egui::Ui, feed: egui::Rect) -> bool {
-        let h = 26.0;
-        let pad = 12.0;
-        let gap = 6.0;
-
-        let mut labels: Vec<(&str, bool)> = Vec::new();
-        if self.marking_region {
-            labels.push(("Cancel", true));
-        } else {
-            labels.push(("Mark", false));
+    fn begin_mark_region(&mut self) {
+        if self.region.is_some() {
+            self.clear_region();
         }
-        if self.region.is_some() && !self.marking_region {
-            labels.push(("Clear", false));
-        }
-        labels.push(("B&W", self.show_model_view));
+        self.marking_region = true;
+    }
 
-        // Lay out right to left so the row hugs the corner.
-        let mut x = feed.right() - pad;
-        let y = feed.bottom() - pad - h;
-        let mut hits: Vec<(egui::Rect, &str)> = Vec::new();
-        for (text, on) in labels.iter().rev() {
-            let w = (text.len() as f32 * 7.0 + 22.0).max(46.0);
-            let r = egui::Rect::from_min_size(Pos2::new(x - w, y), Vec2::new(w, h));
-            x = r.left() - gap;
-
-            let id = ui.id().with(("live_ctl", *text));
-            let resp = ui.interact(r, id, Sense::click());
-            let bg = if *on {
-                BLUE
-            } else if resp.hovered() {
-                Color32::from_rgb(70, 70, 74)
-            } else {
-                Color32::from_rgba_unmultiplied(28, 28, 30, 220)
-            };
-            ui.painter().rect_filled(r, CornerRadius::same(7), bg);
-            ui.painter().text(
-                r.center(),
-                egui::Align2::CENTER_CENTER,
-                *text,
-                egui::FontId::proportional(12.0),
-                if *on { Color32::WHITE } else { TEXT },
-            );
-            if resp.clicked() {
-                hits.push((r, text));
-            }
-        }
-
-        for (_, text) in hits {
-            match text {
-                // Marking always starts from a clean frame, so pressing Mark
-                // again simply replaces whatever box was there.
-                "Mark" => {
-                    if self.region.is_some() {
-                        self.clear_region();
-                    }
-                    self.marking_region = true;
-                }
-                "Cancel" => {
-                    self.marking_region = false;
-                    self.box_drag_start = None;
-                    self.box_drag_now = None;
-                }
-                "B&W" => self.show_model_view = !self.show_model_view,
-                "Clear" => self.clear_region(),
-                _ => {}
-            }
-        }
-
-        if self.marking_region {
-            ui.painter().text(
-                Pos2::new(feed.left() + 12.0, feed.bottom() - pad - h * 0.5),
-                egui::Align2::LEFT_CENTER,
-                "Drag a box on the view",
-                egui::FontId::proportional(12.0),
-                BLUE,
-            );
-        }
-
-        let row = egui::Rect::from_min_max(
-            Pos2::new(x, y),
-            Pos2::new(feed.right() - pad, y + h),
-        );
-        ui.ctx()
-            .pointer_latest_pos()
-            .map(|p| row.contains(p))
-            .unwrap_or(false)
+    fn cancel_mark_region(&mut self) {
+        self.marking_region = false;
+        self.box_drag_start = None;
+        self.box_drag_now = None;
     }
 
     /// Keep the two diagnostic panes in step with the live frame.
@@ -1632,17 +1844,9 @@ impl App {
         Some(((score - self.match_threshold()).abs() / spread).clamp(0.0, 1.0))
     }
 
-    /// Where the line sits: operator setting or auto suggestion, then raised
-    /// if any full sample would sit too close to that line.
+    /// Where the empty-match line sits: operator setting, or auto from
+    /// how tightly the reference photos agree.
     fn match_threshold(&self) -> f32 {
-        let base = self.base_match_threshold();
-        match self.reference.as_ref() {
-            Some(r) => vision::enforce_full_sample_floor(base, r),
-            None => base,
-        }
-    }
-
-    fn base_match_threshold(&self) -> f32 {
         let set = self.cfg.level.empty_match_threshold;
         if set > 0.0 {
             return set;
@@ -1661,15 +1865,19 @@ impl App {
         };
         match vision::save_reference_photo(w, h, &rgb) {
             Ok(path) => {
+                self.dataset_dirty = true;
+                self.refresh_samples();
                 if let Some(cloud) = &self.cloud {
-                    if let (Ok(bytes), Some(name)) = (
-                        std::fs::read(&path),
-                        path.file_name().and_then(|n| n.to_str()),
-                    ) {
-                        cloud.upload_jpeg(&cloud.empty_photo_path(name), bytes);
+                    if let Some(meta) = self
+                        .samples
+                        .iter()
+                        .find(|s| s.path == path)
+                        .cloned()
+                    {
+                        let sb = cloud.clone();
+                        std::thread::spawn(move || sb.sync_reference_image(&meta));
                     }
                 }
-                self.dataset_dirty = true;
                 self.rebuild_reference();
             }
             Err(e) => self.note = format!("Capture failed: {e}"),
@@ -1695,13 +1903,20 @@ impl App {
             Ok(r) => {
                 let n = r.count();
                 self.stats.labels_empty = n as u64;
-                self.stats.labels_full = vision::list_full_samples().len() as u64;
+                self.stats.labels_full = self
+                    .samples
+                    .iter()
+                    .filter(|s| s.label_empty == Some(false))
+                    .count() as u64;
                 self.stats.last_train_unix = Some(r.built_at_unix);
                 self.stats.last_train_accuracy = Some(r.cohesion);
                 self.stats.save();
                 let warn = r.cohesion_warning();
                 self.reference = Some(r);
                 self.publish_reference();
+                if let Some(cloud) = &self.cloud {
+                    cloud.sync_all_reference_images();
+                }
                 self.note = match warn {
                     Some(w) => format!("Reference updated — {n} photos. {w}"),
                     None => format!("Reference updated — {n} photos"),
@@ -1749,29 +1964,28 @@ impl App {
     fn program_sender(&mut self) -> bool {
         self.apply_peltor_channel();
         let ch = self.cfg.radio.channel;
-        match sa828::program(
-            &self.cfg.radio.frequency_mhz,
+        match sa828::program_plan(
             self.cfg.radio.squelch,
             self.cfg.radio.ctcss,
             &self.cfg.radio.uart_port,
         ) {
             Ok(msg) => {
+                let pins = silo_alert::select_channel(ch);
                 let _ = self.cfg.save();
-                self.note = format!("Ch {ch} programmed.\n{msg}");
+                let detail = match pins {
+                    Ok(()) => format!("Ch {ch} selected.\n{msg}"),
+                    Err(e) => format!("{msg}\n{e}"),
+                };
+                self.term_radio(&detail);
+                self.note.clear();
                 true
             }
             Err(e) => {
-                self.note = format!("SA828 program failed (Ch {ch} not applied): {e}");
+                self.term_radio(&format!("SA828 program failed (Ch {ch} not applied): {e}"));
+                self.note.clear();
                 false
             }
         }
-    }
-
-    fn read_radio(&mut self) {
-        self.note = match sa828::read(&self.cfg.radio.uart_port) {
-            Ok(msg) => msg,
-            Err(e) => e,
-        };
     }
 
     fn save_config(&mut self) {
@@ -1779,23 +1993,44 @@ impl App {
         self.cfg.radio.ctcss = peltor::clamp_ctcss(self.cfg.radio.ctcss);
         silo_alert::set_ptt_pin(self.cfg.radio.ptt_gpio);
         silo_alert::set_spken_pin(self.cfg.radio.spken_gpio);
+        silo_alert::set_channel_pins(
+            self.cfg.radio.ch_bit1_gpio,
+            self.cfg.radio.ch_bit2_gpio,
+            self.cfg.radio.ch_bit4_gpio,
+            self.cfg.radio.ch_bit8_gpio,
+        );
+        let _ = silo_alert::select_channel(self.cfg.radio.channel);
         silo_alert::set_audio_device(&self.cfg.radio.audio_device);
         silo_alert::set_muted(self.cfg.radio.muted);
         match self.cfg.save() {
             Ok(()) => {
-                // Push RF settings so Save never leaves the module on a stale channel.
-                match sa828::program(
-                    &self.cfg.radio.frequency_mhz,
+                // One Save: write config, program SA828, then read it back.
+                match sa828::program_plan(
                     self.cfg.radio.squelch,
                     self.cfg.radio.ctcss,
                     &self.cfg.radio.uart_port,
                 ) {
                     Ok(msg) => {
-                        self.note = format!("Saved. Ch {} programmed.\n{msg}", self.cfg.radio.channel)
+                        self.term_radio(&format!(
+                            "Ch {} selected.\n{msg}",
+                            self.cfg.radio.channel
+                        ));
+                        match sa828::read(&self.cfg.radio.uart_port) {
+                            Ok(readback) => {
+                                self.term_radio(&readback);
+                                self.note = "Saved — module programmed and verified.".into();
+                            }
+                            Err(e) => {
+                                self.term_radio(&e);
+                                self.note =
+                                    "Saved and programmed (readback failed — see terminal)."
+                                        .into();
+                            }
+                        }
                     }
                     Err(e) => {
-                        self.note =
-                            format!("Saved config, but SA828 program failed: {e}")
+                        self.term_radio(&format!("SA828 program failed: {e}"));
+                        self.note = "Saved (radio program failed — see terminal).".into();
                     }
                 }
             }
@@ -1803,36 +2038,23 @@ impl App {
         }
     }
 
-    fn add_full_photo(&mut self) {
-        let Some((w, h, rgb)) = self.last_rgb.clone() else {
-            self.note = "No frame yet".into();
+    fn set_monitoring(&mut self, on: bool) {
+        if on && !self.can_start() {
+            self.note = "Mark a region and take empty photos first".into();
             return;
-        };
-        match vision::save_full_photo(w, h, &rgb) {
-            Ok(_) => {
-                self.stats.labels_full = vision::list_full_samples().len() as u64;
-                self.stats.save();
-                self.note = "Full sample saved".into();
-                self.term_line(Self::term_now("full sample saved"));
-            }
-            Err(e) => self.note = format!("Capture failed: {e}"),
         }
-    }
-
-    fn set_armed(&mut self, armed: bool) {
-        self.armed = armed;
-        self.stats.armed = armed;
-        if armed {
+        self.monitor = on;
+        self.stats.armed = on;
+        self.stats.monitor_paused = !on;
+        if on {
             self.stats.wizard_done = true;
-            self.stats.monitor_paused = false;
-            self.monitor = true;
-            self.term_line(Self::term_now("monitoring armed"));
+            self.term_line(Self::term_now("monitoring started"));
             if let Some(cloud) = &self.cloud {
                 cloud.push_event("armed", Some(self.empty), None);
             }
         } else {
-            self.term_line(Self::term_now("monitoring disarmed"));
-            // Do not clear announce latch — re-arm while still empty must not re-TX.
+            self.term_line(Self::term_now("monitoring stopped"));
+            // Do not clear announce latch — start again while still empty must not re-TX.
             if let Some(cloud) = &self.cloud {
                 cloud.push_event("disarmed", Some(self.empty), None);
             }
@@ -1840,35 +2062,26 @@ impl App {
         self.stats.save();
     }
 
-    fn set_paused(&mut self, paused: bool) {
-        self.monitor = !paused;
-        self.stats.monitor_paused = paused;
-        self.stats.save();
-        if paused {
-            self.term_line(Self::term_now("monitoring paused"));
-        } else {
-            self.term_line(Self::term_now("monitoring resumed"));
-        }
-    }
-
-    fn can_arm(&self) -> bool {
+    fn can_start(&self) -> bool {
         self.region.is_some() && self.reference.as_ref().map(|r| r.count() >= 1).unwrap_or(false)
     }
 
     fn wizard_step(&self) -> Option<&'static str> {
-        if self.armed || self.stats.wizard_done {
+        if self.monitor || self.stats.wizard_done {
             return None;
         }
         if self.region.is_none() {
             return Some("1  Mark the region");
         }
-        if self.samples.len() < 3 {
+        let empty_n = self
+            .samples
+            .iter()
+            .filter(|s| s.label_empty != Some(false))
+            .count();
+        if empty_n < 3 {
             return Some("2  Take 3 empty photos");
         }
-        if vision::list_full_samples().is_empty() {
-            return Some("3  Optional: take a full sample");
-        }
-        Some("4  Arm when the dry-run looks right")
+        Some("3  Start when it looks right")
     }
 
     fn dry_run_line(&self) -> Option<String> {
@@ -1879,18 +2092,6 @@ impl App {
         } else {
             Some(format!("would not  ({:.0}% < {:.0}%)", score * 100.0, th * 100.0))
         }
-    }
-
-    fn false_empty_risk(&self) -> Option<String> {
-        let r = self.reference.as_ref()?;
-        let risk = vision::false_empty_risk(r, self.match_threshold())?;
-        Some(if risk < 0.34 {
-            "Low".into()
-        } else if risk < 0.67 {
-            "Medium".into()
-        } else {
-            "High".into()
-        })
     }
 
     fn ensure_evidence(&mut self, ctx: &egui::Context) {
@@ -1906,6 +2107,149 @@ impl App {
         }
     }
 
+    /// Continuous learning: label the last alert Empty or Full and fine-tune.
+    fn label_last_alert(&mut self, empty: bool) {
+        let Some(thumb) = self
+            .evidence_path
+            .clone()
+            .or_else(vision::latest_alert_evidence)
+        else {
+            self.note = "No alert to label".into();
+            return;
+        };
+
+        // Prefer the full train frame. Older alerts only kept a ROI thumb —
+        // recover a full frame from memory or cloud before labeling.
+        if let Some(unix) = thumb
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .and_then(|s| s.parse::<u64>().ok())
+        {
+            let train = std::path::PathBuf::from(vision::ALERTS_DIR)
+                .join(format!("{unix}_train.jpg"));
+            if !train.is_file() {
+                let mut wrote = false;
+                if let Some((w, h, rgb)) = self.last_rgb.as_ref() {
+                    wrote = vision::save_rgb_jpeg(
+                        train.to_str().unwrap_or("data/tmp_alert_train.jpg"),
+                        *w,
+                        *h,
+                        rgb,
+                    )
+                    .is_ok();
+                }
+                if !wrote {
+                    if let Some(cloud) = &self.cloud {
+                        if let Ok(bytes) = cloud.download_object(&cloud.alert_frame_path(unix)) {
+                            if let Ok(img) = image::load_from_memory(&bytes) {
+                                let rgb8 = img.to_rgb8();
+                                let (w, h) = rgb8.dimensions();
+                                wrote = vision::save_rgb_jpeg(
+                                    train.to_str().unwrap_or("data/tmp_alert_train.jpg"),
+                                    w,
+                                    h,
+                                    &rgb8.into_raw(),
+                                )
+                                .is_ok();
+                            }
+                        }
+                    }
+                }
+                if !wrote {
+                    self.note =
+                        "No full alert frame to train on — label the next alert instead".into();
+                    return;
+                }
+            }
+        }
+
+        match vision::label_alert_at(&thumb, empty) {
+            Ok(path) => {
+                self.dataset_dirty = true;
+                self.refresh_samples();
+
+                // Select the new photo in Config → Detection library.
+                let file_name = path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or_default()
+                    .to_string();
+                if let Some(i) = self
+                    .samples
+                    .iter()
+                    .position(|s| s.file_name == file_name || s.path == path)
+                {
+                    self.load_sample_preview(i);
+                }
+
+                // Push colour + B&W + silo_reference_images row to Supabase.
+                if let Some(cloud) = &self.cloud {
+                    if let Some(meta) = self
+                        .samples
+                        .iter()
+                        .find(|s| s.file_name == file_name || s.path == path)
+                        .cloned()
+                    {
+                        let sb = cloud.clone();
+                        std::thread::spawn(move || {
+                            sb.sync_reference_image(&meta);
+                            eprintln!(
+                                "supabase: feedback {} → {}",
+                                if empty { "empty" } else { "full" },
+                                meta.file_name
+                            );
+                        });
+                    }
+                }
+
+                if !empty {
+                    // False empty alert — clear the sticky latch immediately.
+                    self.empty = false;
+                    self.empty_since = None;
+                    self.empty_streak = 0;
+                    self.full_streak = 0;
+                    self.full_since = None;
+                    self.stats.empty_state = false;
+                    self.stats.empty_since_unix = None;
+                    self.stats.save();
+                    if let Some(alert) = &mut self.alert {
+                        alert.on_filled();
+                    }
+                    if let Some(cloud) = &self.cloud {
+                        cloud.push_event("full", Some(false), self.last_match);
+                    }
+                }
+
+                // Rebuild model (includes Full negatives) and sync whole library.
+                self.rebuild_reference();
+
+                // Hide Last alert on Home — training is done for this frame.
+                self.evidence_path = None;
+                self.evidence_tex = None;
+                self.evidence_feedback = Some(empty);
+
+                let kind = if empty { "Empty" } else { "Full" };
+                self.note = format!(
+                    "Saved as {kind} — image sent to Config → Detection, model trained"
+                );
+                self.term_line(Self::term_now(&format!(
+                    "feedback  {} → Config + model trained ({})",
+                    if empty { "empty" } else { "full" },
+                    file_name
+                )));
+                eprintln!(
+                    "feedback: labeled last alert as {} ({})",
+                    if empty { "empty" } else { "full" },
+                    file_name
+                );
+            }
+            Err(e) => {
+                eprintln!("feedback: label failed: {e}");
+                self.note = e;
+            }
+        }
+    }
+
     fn plant_state(&self) -> PlantState {
         let cam_dead = self.cam_down_since.is_some()
             || (self.last_frame_at.is_none() && self.started_at.elapsed() >= CAM_GRACE);
@@ -1915,16 +2259,20 @@ impl App {
         if self.radio_fault && !self.cfg.radio.muted {
             return PlantState::RadioFault;
         }
-        if !self.armed {
-            return PlantState::Disarmed;
-        }
         if !self.monitor {
-            return PlantState::Paused;
+            return PlantState::Stopped;
         }
         if self.empty {
             PlantState::Empty
         } else {
             PlantState::Ok
+        }
+    }
+
+    fn tick_host(&mut self) {
+        self.host.tick();
+        if let Some(bits) = self.host.snapshot().and_then(|s| s.throttled) {
+            self.last_throttled = Some(bits);
         }
     }
 
@@ -1981,7 +2329,7 @@ impl App {
 
     /// Read the Pi throttled register and store it in Supabase as kind `power`.
     fn report_power(&mut self) {
-        let Some(bits) = read_throttled() else {
+        let Some(bits) = host::read_throttled() else {
             return;
         };
         self.last_throttled = Some(bits);
@@ -2008,7 +2356,7 @@ impl App {
     /// One row a day while the silo is full, so the day has a timestamp
     /// without a row for every check.
     fn note_full_day(&mut self) {
-        if !self.armed || !self.monitor || self.empty || self.cam_down_since.is_some() {
+        if !self.monitor || self.empty || self.cam_down_since.is_some() {
             return;
         }
         let due = self
@@ -2039,10 +2387,50 @@ impl App {
             self.load_sample_preview(i);
         } else {
             self.sample_tex = None;
+            self.sample_bw_tex = None;
             self.sample_view = None;
         }
-        self.stats.labels_empty = self.samples.len() as u64;
-        self.stats.labels_full = vision::list_full_samples().len() as u64;
+        self.stats.labels_empty = self
+            .samples
+            .iter()
+            .filter(|s| s.label_empty != Some(false))
+            .count() as u64;
+        self.stats.labels_full = self
+            .samples
+            .iter()
+            .filter(|s| s.label_empty == Some(false))
+            .count() as u64;
+    }
+
+    /// Label the selected photo Empty or Not empty and rebuild the match set.
+    fn set_selected_empty(&mut self, empty: bool) {
+        let Some(idx) = self.sample_idx.filter(|i| *i < self.samples.len()) else {
+            return;
+        };
+        let meta = self.samples[idx].clone();
+        match vision::set_sample_empty(&meta.path, empty) {
+            Ok(_) => {
+                let keep = meta.file_name.clone();
+                self.refresh_samples();
+                if let Some(i) = self.samples.iter().position(|s| s.file_name == keep) {
+                    self.load_sample_preview(i);
+                }
+                if let Some(cloud) = &self.cloud {
+                    if let Some(updated) = self.samples.iter().find(|s| s.file_name == keep).cloned()
+                    {
+                        let sb = cloud.clone();
+                        std::thread::spawn(move || sb.sync_reference_image(&updated));
+                    }
+                }
+                self.rebuild_reference();
+                self.note = if empty {
+                    "Labeled Empty — used for detection".into()
+                } else {
+                    "Labeled Not empty — kept for reference only".into()
+                };
+            }
+            Err(e) => self.note = e,
+        }
     }
 
     fn load_sample_preview(&mut self, idx: usize) {
@@ -2051,6 +2439,9 @@ impl App {
         }
         self.sample_idx = Some(idx);
         let meta = self.samples[idx].clone();
+        // Force textures to refresh for the newly selected photo.
+        self.sample_tex = None;
+        self.sample_bw_tex = None;
         match vision::analyze_sample(&meta.path, self.reference.as_ref()) {
             Ok(view) => {
                 self.sample_view = Some(view);
@@ -2067,13 +2458,27 @@ impl App {
         let Some(view) = self.sample_view.as_ref() else {
             return;
         };
-        let img = egui::ColorImage::from_rgb(
-            [view.width as usize, view.height as usize],
-            &view.rgb,
-        );
-        match &mut self.sample_tex {
-            Some(t) => t.set(img, Default::default()),
-            None => self.sample_tex = Some(ctx.load_texture("sample", img, Default::default())),
+        if self.sample_tex.is_none() {
+            let img = egui::ColorImage::from_rgb(
+                [view.width as usize, view.height as usize],
+                &view.rgb,
+            );
+            self.sample_tex = Some(ctx.load_texture("sample", img, Default::default()));
+        }
+        if self.sample_bw_tex.is_none() {
+            if let Some(i) = self.sample_idx {
+                if let Some(meta) = self.samples.get(i) {
+                    let bw_path = vision::bw_path_for(&meta.file_name);
+                    if let Ok((w, h, rgba)) = vision::load_thumb_rgba(&bw_path, 960) {
+                        let img = egui::ColorImage::from_rgba_unmultiplied(
+                            [w as usize, h as usize],
+                            &rgba,
+                        );
+                        self.sample_bw_tex =
+                            Some(ctx.load_texture("sample_bw", img, Default::default()));
+                    }
+                }
+            }
         }
     }
 
@@ -2111,9 +2516,14 @@ impl App {
         let key = meta.path.to_string_lossy().to_string();
         match vision::delete_sample(&meta.path) {
             Ok(()) => {
+                if let Some(cloud) = &self.cloud {
+                    cloud.delete_reference_image(&meta.file_name);
+                }
                 self.thumb_tex.remove(&key);
+                self.thumb_tex.remove(&format!("bw:{}", meta.file_name));
                 self.sample_view = None;
                 self.sample_tex = None;
+                self.sample_bw_tex = None;
                 self.sample_idx = None;
                 self.refresh_samples();
                 let idxs: Vec<usize> = (0..self.samples.len()).collect();
@@ -2133,8 +2543,7 @@ impl App {
         }
     }
 
-    /// Library: every image at once in a scrolling grid, so a long capture
-    /// session is actually browsable.
+    /// Every empty-silo photo, camera view on top and B&W below.
     fn draw_library_grid(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         let idxs: Vec<usize> = (0..self.samples.len()).collect();
         for &i in &idxs {
@@ -2142,130 +2551,113 @@ impl App {
             self.ensure_thumb(ctx, &meta);
         }
 
-        let avail = ui.available_size();
         let mut clicked: Option<usize> = None;
         let total = idxs.len();
+        ui.label(
+            RichText::new(format!("{total} images"))
+                .size(12.0)
+                .color(MUTED),
+        );
+        ui.add_space(10.0);
 
-        egui::Frame::new()
-            .fill(VIDEO_BG)
-            .corner_radius(16)
-            .inner_margin(egui::Margin::same(14))
-            .show(ui, |ui| {
-                ui.set_min_size(avail);
-                ui.horizontal(|ui| {
-                    ui.label(
-                        RichText::new(format!("{total} images"))
-                            .size(12.0)
-                            .color(MUTED),
+        if idxs.is_empty() {
+            ui.label(
+                RichText::new("Nothing here — take reference photos on Home.")
+                    .size(13.0)
+                    .color(MUTED),
+            );
+            return;
+        }
+
+        let cell_w = 160.0;
+        let cell_h = 230.0;
+        let gap = 10.0;
+        let width = ui.available_width().max(cell_w);
+        let cols = (((width + gap) / (cell_w + gap)).floor() as usize).max(1);
+
+        for row in idxs.chunks(cols) {
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = gap;
+                for &i in row {
+                    let meta = &self.samples[i];
+                    let key = meta.path.to_string_lossy().to_string();
+                    let bw_key = format!("bw:{}", meta.file_name);
+                    let selected = self.sample_idx == Some(i);
+                    let state = if meta.label_empty == Some(false) {
+                        "Not empty"
+                    } else {
+                        "Empty"
+                    };
+                    let caption = format!("{state}  ·  {}", fmt_ms(meta.captured_ms));
+                    let (rect, resp) =
+                        ui.allocate_exact_size(Vec2::new(cell_w, cell_h), Sense::click());
+                    ui.painter().rect_filled(
+                        rect,
+                        CornerRadius::same(10),
+                        Color32::from_rgb(18, 18, 20),
                     );
-                });
-                ui.add_space(10.0);
 
-                egui::ScrollArea::vertical()
-                    .auto_shrink([false, false])
-                    .show(ui, |ui| {
-                        if idxs.is_empty() {
-                            ui.add_space(avail.y * 0.25);
-                            ui.vertical_centered(|ui| {
-                                ui.label(
-                                    RichText::new("Nothing here").size(16.0).color(MUTED),
-                                );
-                                ui.add_space(6.0);
-                                ui.label(
-                                    RichText::new(
-                                        "Capture frames on Live, or change the filter.",
-                                    )
-                                    .size(13.0)
-                                    .color(MUTED),
-                                );
-                            });
-                            return;
-                        }
+                    let half = (cell_h - 52.0) * 0.5;
+                    let uv = egui::Rect::from_min_max(
+                        egui::pos2(0.0, 0.0),
+                        egui::pos2(1.0, 1.0),
+                    );
+                    for (n, k) in [&key, &bw_key].into_iter().enumerate() {
+                        let Some(tex) = self.thumb_tex.get(k) else {
+                            continue;
+                        };
+                        let slot = egui::Rect::from_min_size(
+                            Pos2::new(
+                                rect.left() + 6.0,
+                                rect.top() + 6.0 + n as f32 * (half + 4.0),
+                            ),
+                            Vec2::new(cell_w - 12.0, half),
+                        );
+                        let size = tex.size_vec2();
+                        let scale = (slot.width() / size.x)
+                            .min(slot.height() / size.y)
+                            .max(0.01);
+                        let draw = size * scale;
+                        let img_rect = egui::Rect::from_center_size(slot.center(), draw);
+                        ui.painter().image(tex.id(), img_rect, uv, Color32::WHITE);
+                    }
 
-                        // Each cell holds both pictures of one reference:
-                        // the camera view on top, black and white below.
-                        let cell_w = 150.0;
-                        let cell_h = 200.0;
-                        let gap = 10.0;
-                        let width = ui.available_width().max(cell_w);
-                        let cols = (((width + gap) / (cell_w + gap)).floor() as usize).max(1);
-
-                        for row in idxs.chunks(cols) {
-                            ui.horizontal(|ui| {
-                                ui.spacing_mut().item_spacing.x = gap;
-                                for &i in row {
-                                    let meta = &self.samples[i];
-                                    let key = meta.path.to_string_lossy().to_string();
-                                    let bw_key = format!("bw:{}", meta.file_name);
-                                    let selected = self.sample_idx == Some(i);
-                                    let (rect, resp) = ui.allocate_exact_size(
-                                        Vec2::new(cell_w, cell_h),
-                                        Sense::click(),
-                                    );
-                                    ui.painter().rect_filled(
-                                        rect,
-                                        CornerRadius::same(10),
-                                        Color32::from_rgb(18, 18, 20),
-                                    );
-
-                                    let half = (cell_h - 34.0) * 0.5;
-                                    let uv = egui::Rect::from_min_max(
-                                        egui::pos2(0.0, 0.0),
-                                        egui::pos2(1.0, 1.0),
-                                    );
-                                    for (n, k) in [&key, &bw_key].into_iter().enumerate() {
-                                        let Some(tex) = self.thumb_tex.get(k) else {
-                                            continue;
-                                        };
-                                        let slot = egui::Rect::from_min_size(
-                                            Pos2::new(
-                                                rect.left() + 6.0,
-                                                rect.top() + 6.0 + n as f32 * (half + 4.0),
-                                            ),
-                                            Vec2::new(cell_w - 12.0, half),
-                                        );
-                                        let size = tex.size_vec2();
-                                        let scale = (slot.width() / size.x)
-                                            .min(slot.height() / size.y)
-                                            .max(0.01);
-                                        let draw = size * scale;
-                                        let img_rect =
-                                            egui::Rect::from_center_size(slot.center(), draw);
-                                        ui.painter()
-                                            .image(tex.id(), img_rect, uv, Color32::WHITE);
-                                    }
-
-                                    ui.painter().text(
-                                        Pos2::new(rect.left() + 10.0, rect.bottom() - 12.0),
-                                        egui::Align2::LEFT_CENTER,
-                                        fmt_ms(meta.captured_ms),
-                                        egui::FontId::proportional(11.0),
-                                        MUTED,
-                                    );
-                                    if selected {
-                                        ui.painter().rect_stroke(
-                                            rect,
-                                            CornerRadius::same(10),
-                                            Stroke::new(2.0_f32, BLUE),
-                                            egui::StrokeKind::Inside,
-                                        );
-                                    } else if resp.hovered() {
-                                        ui.painter().rect_stroke(
-                                            rect,
-                                            CornerRadius::same(10),
-                                            Stroke::new(1.0_f32, HAIRLINE),
-                                            egui::StrokeKind::Inside,
-                                        );
-                                    }
-                                    if resp.clicked() {
-                                        clicked = Some(i);
-                                    }
-                                }
-                            });
-                            ui.add_space(gap);
-                        }
-                    });
+                    ui.painter().text(
+                        Pos2::new(rect.left() + 10.0, rect.bottom() - 28.0),
+                        egui::Align2::LEFT_CENTER,
+                        format!("#{}", i + 1),
+                        egui::FontId::proportional(11.0),
+                        BLUE,
+                    );
+                    ui.painter().text(
+                        Pos2::new(rect.left() + 10.0, rect.bottom() - 12.0),
+                        egui::Align2::LEFT_CENTER,
+                        truncate_chars(&caption, 22),
+                        egui::FontId::proportional(11.0),
+                        MUTED,
+                    );
+                    if selected {
+                        ui.painter().rect_stroke(
+                            rect,
+                            CornerRadius::same(10),
+                            Stroke::new(2.0_f32, BLUE),
+                            egui::StrokeKind::Inside,
+                        );
+                    } else if resp.hovered() {
+                        ui.painter().rect_stroke(
+                            rect,
+                            CornerRadius::same(10),
+                            Stroke::new(1.0_f32, HAIRLINE),
+                            egui::StrokeKind::Inside,
+                        );
+                    }
+                    if resp.clicked() {
+                        clicked = Some(i);
+                    }
+                }
             });
+            ui.add_space(gap);
+        }
 
         if let Some(i) = clicked {
             self.load_sample_preview(i);
@@ -2381,8 +2773,7 @@ impl App {
 enum PlantState {
     CameraFault,
     RadioFault,
-    Disarmed,
-    Paused,
+    Stopped,
     Empty,
     Ok,
 }
@@ -2392,8 +2783,7 @@ impl PlantState {
         match self {
             PlantState::CameraFault => "CAMERA FAULT",
             PlantState::RadioFault => "RADIO FAULT",
-            PlantState::Disarmed => "DISARMED",
-            PlantState::Paused => "PAUSED",
+            PlantState::Stopped => "STOPPED",
             PlantState::Empty => "EMPTY",
             PlantState::Ok => "OK",
         }
@@ -2402,7 +2792,7 @@ impl PlantState {
     fn color(self) -> Color32 {
         match self {
             PlantState::CameraFault | PlantState::RadioFault | PlantState::Empty => RED,
-            PlantState::Disarmed | PlantState::Paused => MUTED,
+            PlantState::Stopped => MUTED,
             PlantState::Ok => TEXT,
         }
     }
@@ -2411,6 +2801,11 @@ impl PlantState {
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         pet_watchdog();
+        // Linux IME events can swallow TextEdit keystrokes (host/user/password).
+        ctx.input_mut(|i| {
+            i.events
+                .retain(|e| !matches!(e, egui::Event::Ime(_)));
+        });
         style(ctx);
         self.ensure_logo(ctx);
         self.take_radio_status();
@@ -2421,13 +2816,16 @@ impl eframe::App for App {
         self.sync_model_view(ctx);
         self.tick_heartbeat();
         self.maybe_daily_power();
-        if self.page == Page::Model && self.sample_idx.is_some() {
+        self.tick_host();
+        if self.page == Page::Config
+            && self.config_tab == ConfigTab::Detection
+            && self.sample_idx.is_some()
+        {
             self.sync_sample_tex(ctx);
         }
         ctx.request_repaint_after(Duration::from_millis(100));
 
         let has_reference = self.reference.is_some();
-        let is_home = self.page == Page::Home;
 
         egui::TopBottomPanel::top("navbar")
             .exact_height(NAV_H)
@@ -2438,6 +2836,7 @@ impl eframe::App for App {
             )
             .show(ctx, |ui| {
                 ui.spacing_mut().item_spacing = Vec2::ZERO;
+                let mut toggle_monitor = false;
                 ui.horizontal(|ui| {
                     // Logo cell — larger square segment, mark painted dead-center
                     let cell = Vec2::new(LOGO_CELL, NAV_H);
@@ -2452,15 +2851,43 @@ impl eframe::App for App {
                         ui.painter().image(logo.id(), img_rect, uv, Color32::WHITE);
                     }
                     nav_bar(ui, &mut self.page);
+                    // Green play / red pause — always on the right of the top bar.
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.add_space(14.0);
+                        if monitor_play_btn(ui, self.monitor).clicked() {
+                            toggle_monitor = true;
+                        }
+                    });
                 });
+                if toggle_monitor {
+                    self.set_monitoring(!self.monitor);
+                }
                 // Bottom hairline across the bar
                 let r = ui.max_rect();
                 ui.painter()
                     .hline(r.x_range(), r.bottom() - 0.5, Stroke::new(1.0_f32, HAIRLINE));
             });
 
-        // Home is a blank canvas — no plant sidebar / terminal.
-        if !is_home {
+        if self.page == Page::Config {
+            egui::SidePanel::left("config_side")
+                .exact_width(168.0)
+                .resizable(false)
+                .frame(
+                    egui::Frame::new()
+                        .fill(CARD)
+                        .inner_margin(egui::Margin {
+                            left: 14,
+                            right: 14,
+                            top: 22,
+                            bottom: 22,
+                        }),
+                )
+                .show(ctx, |ui| {
+                    self.config_sidebar(ui);
+                });
+        }
+
+        if self.page != Page::Config {
             egui::SidePanel::right("side")
                 .exact_width(356.0)
                 .resizable(false)
@@ -2476,8 +2903,10 @@ impl eframe::App for App {
                 )
                 .show(ctx, |ui| {
                     match self.page {
-                    Page::Home => {}
                     Page::Live => {
+                        scroll_y()
+                            .auto_shrink([false, false])
+                            .show(ui, |ui| {
                         let interval = self.cfg.level.check_interval_seconds.max(1.0);
                         let next_in = self
                             .last_check_at
@@ -2485,7 +2914,7 @@ impl eframe::App for App {
                             .unwrap_or(0);
                         let state = self.plant_state();
 
-                        ui.label(RichText::new("Live").size(22.0).color(TEXT).strong());
+                        ui.label(RichText::new("Home").size(22.0).color(TEXT).strong());
                         ui.add_space(6.0);
                         ui.label(
                             RichText::new(state.label())
@@ -2507,20 +2936,40 @@ impl eframe::App for App {
                             .size(14.0)
                             .color(MUTED),
                         );
-                        ui.add_space(4.0);
-                        let power = self
-                            .last_throttled
-                            .map(|b| format!("0x{b:x}"))
-                            .unwrap_or_else(|| "—".into());
-                        let power_color = match self.last_throttled {
-                            Some(0) | None => MUTED,
-                            Some(_) => RED,
-                        };
-                        ui.label(
-                            RichText::new(format!("Power  {power}"))
-                                .size(13.0)
-                                .color(power_color),
-                        );
+                        ui.add_space(14.0);
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing = Vec2::new(8.0, 0.0);
+                            let side = 40.0;
+                            if self.marking_region {
+                                if icon_btn(ui, side, true, LiveIcon::Cancel, "Cancel mark")
+                                    .clicked()
+                                {
+                                    self.cancel_mark_region();
+                                }
+                            } else if icon_btn(ui, side, false, LiveIcon::Crop, "Mark region")
+                                .clicked()
+                            {
+                                self.begin_mark_region();
+                            }
+                            if self.region.is_some() && !self.marking_region {
+                                if icon_btn(ui, side, false, LiveIcon::Clear, "Clear region")
+                                    .clicked()
+                                {
+                                    self.clear_region();
+                                }
+                            }
+                            if icon_btn(
+                                ui,
+                                side,
+                                self.show_model_view,
+                                LiveIcon::Filter,
+                                "Filter",
+                            )
+                            .clicked()
+                            {
+                                self.show_model_view = !self.show_model_view;
+                            }
+                        });
 
                         if let Some(step) = self.wizard_step() {
                             ui.add_space(10.0);
@@ -2536,20 +2985,16 @@ impl eframe::App for App {
                             match self.confidence() {
                                 Some(c) => {
                                     ui.horizontal(|ui| {
+                                        ui.spacing_mut().item_spacing.x = 12.0;
                                         ui.label(
                                             RichText::new("Confidence")
                                                 .size(12.0)
                                                 .color(MUTED),
                                         );
-                                        ui.with_layout(
-                                            egui::Layout::right_to_left(egui::Align::Center),
-                                            |ui| {
-                                                ui.label(
-                                                    RichText::new(format!("{:.0}%", c * 100.0))
-                                                        .size(12.0)
-                                                        .color(TEXT),
-                                                );
-                                            },
+                                        ui.label(
+                                            RichText::new(format!("{:.0}%", c * 100.0))
+                                                .size(12.0)
+                                                .color(TEXT),
                                         );
                                     });
                                     ui.add_space(4.0);
@@ -2577,10 +3022,68 @@ impl eframe::App for App {
                             );
                         }
 
-                        ui.add_space(12.0);
+                        if self.empty && self.monitor {
+                            ui.add_space(12.0);
+                            row_stat(ui, "Alert", "Sent for this empty");
+                        }
+
+                        // Already-labeled alerts stay off Home; only unlabeled
+                        // evidence asks Empty/Full for continuous learning.
+                        if self.evidence_feedback.is_none() {
+                            self.ensure_evidence(ui.ctx());
+                        }
+                        let evidence = self
+                            .evidence_feedback
+                            .is_none()
+                            .then(|| {
+                                self.evidence_tex.as_ref().map(|tex| {
+                                    let size = tex.size_vec2();
+                                    let w = ui.available_width().min(200.0);
+                                    let scale = w / size.x.max(1.0);
+                                    (tex.id(), size * scale)
+                                })
+                            })
+                            .flatten();
+                        let mut pick: Option<bool> = None;
+                        if let Some((id, draw)) = evidence {
+                            ui.add_space(8.0);
+                            ui.label(RichText::new("Last alert").size(12.0).color(MUTED));
+                            ui.add_space(4.0);
+                            ui.image((id, draw));
+
+                            ui.add_space(10.0);
+                            ui.label(
+                                RichText::new("Was it empty or full?")
+                                    .size(12.0)
+                                    .color(MUTED),
+                            );
+                            ui.add_space(6.0);
+                            // Full-width stacked pills — same pattern as Take reference
+                            // so touch taps register (side-by-side + scroll stole clicks).
+                            if feedback_pill(ui, "Empty", BTN).clicked() {
+                                eprintln!("ui: Home feedback Empty clicked");
+                                pick = Some(true);
+                            }
+                            ui.add_space(8.0);
+                            if feedback_pill(ui, "Full", BTN).clicked() {
+                                eprintln!("ui: Home feedback Full clicked");
+                                pick = Some(false);
+                            }
+                        }
+                        if let Some(empty) = pick {
+                            self.label_last_alert(empty);
+                        }
+
+                        ui.add_space(14.0);
+                        if pill_accent(ui, "Take reference").clicked() {
+                            self.add_reference_photo();
+                        }
+
+                        ui.add_space(14.0);
+                        live_host_stats(ui, self.host.snapshot());
                         row_stat(
                             ui,
-                            "Last TX",
+                            "Last radio call",
                             &self
                                 .stats
                                 .last_radio_unix
@@ -2594,229 +3097,28 @@ impl eframe::App for App {
                                 "Fault"
                             } else if self.cfg.radio.muted {
                                 "Muted"
-                            } else if self
-                                .stats
-                                .last_radio_ok
-                            {
+                            } else if self.stats.last_radio_ok {
                                 "OK"
                             } else {
                                 "—"
                             },
                         );
-                        if self.empty && self.armed {
-                            row_stat(ui, "Alert", "Sent for this empty");
-                        }
-
-                        self.ensure_evidence(ui.ctx());
-                        if let Some(tex) = self.evidence_tex.as_ref() {
-                            ui.add_space(8.0);
-                            ui.label(RichText::new("Last alert").size(12.0).color(MUTED));
-                            ui.add_space(4.0);
-                            let size = tex.size_vec2();
-                            let w = ui.available_width().min(200.0);
-                            let scale = w / size.x.max(1.0);
-                            ui.image((tex.id(), size * scale));
-                        }
-
-                        ui.add_space(14.0);
-                        if pill_accent(ui, "Take reference").clicked() {
-                            self.add_reference_photo();
-                        }
-                        if !self.empty {
-                            ui.add_space(8.0);
-                            if pill(ui, "Take full sample").clicked() {
-                                self.add_full_photo();
-                            }
-                        }
 
                         ui.add_space(12.0);
                         note_line(ui, &self.note);
-                        ui.add_space(8.0);
-                        let pause = if self.monitor { "Pause" } else { "Resume" };
-                        if pill(ui, pause).clicked() {
-                            self.set_paused(self.monitor);
-                        }
-                        ui.add_space(8.0);
-                        if !self.armed {
-                            let can_arm = self.can_arm();
-                            if pill_accent(ui, "Arm").clicked() {
-                                if can_arm {
-                                    self.set_armed(true);
-                                } else {
-                                    self.note = "Mark a region and take empty photos first".into();
-                                }
-                            }
-                        } else if pill(ui, "Disarm").clicked() {
-                            self.set_armed(false);
-                        }
-                    }
-                    Page::Model => {
-                        egui::ScrollArea::vertical()
-                            .auto_shrink([false, false])
-                            .show(ui, |ui| {
-                                ui.label(
-                                    RichText::new("Model").size(22.0).color(TEXT).strong(),
-                                );
-                                ui.add_space(6.0);
-                                ui.label(
-                                    RichText::new(
-                                        "The photos of the empty silo that every frame is compared against.",
-                                    )
-                                    .size(13.0)
-                                    .color(MUTED),
-                                );
-
-                                ui.add_space(14.0);
-                                row_stat(ui, "Photos", &self.samples.len().to_string());
-                                match self.reference.as_ref() {
-                                    Some(r) => {
-                                        row_stat(
-                                            ui,
-                                            "Photos agree",
-                                            &format!("{:.0}%", r.cohesion * 100.0),
-                                        );
-                                        if let Some(warn) = r.cohesion_warning() {
-                                            ui.add_space(4.0);
-                                            ui.label(RichText::new(warn).size(11.0).color(RED));
-                                        }
-                                        row_stat(ui, "Built", &fmt_dt(r.built_at_unix));
-                                    }
-                                    None => {
-                                        row_stat(ui, "Reference", "Not built");
-                                    }
-                                }
-                                row_stat(
-                                    ui,
-                                    "Region",
-                                    if self.region.is_some() { "Marked" } else { "Whole frame" },
-                                );
-                                row_stat(
-                                    ui,
-                                    "Alerts at",
-                                    &format!("{:.0}% match", self.match_threshold() * 100.0),
-                                );
-                                row_stat(
-                                    ui,
-                                    "Full samples",
-                                    &vision::list_full_samples().len().to_string(),
-                                );
-                                if let Some(risk) = self.false_empty_risk() {
-                                    row_stat(ui, "False-empty risk", &risk);
-                                }
-                                if let Some(warn) = self
-                                    .reference
-                                    .as_ref()
-                                    .and_then(|r| {
-                                        vision::full_sample_warning(r, self.base_match_threshold())
-                                    })
-                                {
-                                    ui.add_space(4.0);
-                                    ui.label(RichText::new(warn).size(11.0).color(RED));
-                                }
-
-                                if self.region_changed() {
-                                    ui.add_space(8.0);
-                                    ui.label(
-                                        RichText::new(
-                                            "Region changed — rebuild to apply it.",
-                                        )
-                                        .size(12.0)
-                                        .color(RED),
-                                    );
-                                }
-
-                                ui.add_space(12.0);
-                                if pill_accent(ui, "Rebuild reference").clicked() {
-                                    self.rebuild_reference();
-                                }
-
-                                if let (Some(i), Some(view)) =
-                                    (self.sample_idx, self.sample_view.as_ref())
-                                {
-                                    if let Some(meta) = self.samples.get(i) {
-                                        ui.add_space(16.0);
-                                        ui.label(
-                                            RichText::new("Selected photo")
-                                                .size(12.0)
-                                                .color(MUTED),
-                                        );
-                                        ui.add_space(8.0);
-                                        row_stat(ui, "Taken", &fmt_ms(meta.captured_ms));
-                                        row_stat(
-                                            ui,
-                                            "Size",
-                                            &format!("{}×{}", view.width, view.height),
-                                        );
-                                        row_stat(ui, "Disk", &format_bytes(meta.bytes));
-                                        if let Some(m) = view.match_score {
-                                            row_stat(
-                                                ui,
-                                                "Match",
-                                                &format!("{:.0}%", m * 100.0),
-                                            );
-                                        }
-                                        ui.add_space(10.0);
-                                        if quiet_btn(ui, "Delete").clicked() {
-                                            self.delete_selected();
-                                            self.rebuild_reference();
-                                        }
-                                    }
-                                }
-
-                                ui.add_space(12.0);
-                                note_line(ui, &self.note);
-                                ui.add_space(8.0);
                             });
                     }
                     Page::Stats => {
-                        egui::ScrollArea::vertical()
+                        scroll_y()
                             .auto_shrink([false, false])
                             .show(ui, |ui| self.stats_sidebar(ui));
                     }
-                    Page::Config => {
-                        egui::ScrollArea::vertical()
-                            .auto_shrink([false, false])
-                            .show(ui, |ui| {
-                                ui.label(
-                                    RichText::new("Configure").size(22.0).color(TEXT).strong(),
-                                );
-                                ui.add_space(10.0);
-                                ui.horizontal(|ui| {
-                                    ui.spacing_mut().item_spacing.x = 6.0;
-                                    for (t, label) in [
-                                        (ConfigTab::Detection, "Detection"),
-                                        (ConfigTab::Camera, "Camera"),
-                                        (ConfigTab::Radio, "Radio"),
-                                        (ConfigTab::App, "App"),
-                                    ] {
-                                        if filter_chip(ui, label, self.config_tab == t).clicked() {
-                                            self.config_tab = t;
-                                        }
-                                    }
-                                });
-                                ui.add_space(16.0);
-
-                                match self.config_tab {
-                                    ConfigTab::Detection => self.config_detection(ui),
-                                    ConfigTab::Camera => self.config_camera(ui),
-                                    ConfigTab::Radio => self.config_radio(ui),
-                                    ConfigTab::App => self.config_app(ui),
-                                }
-
-                                ui.add_space(18.0);
-                                if pill_accent(ui, "Save").clicked() {
-                                    self.save_config();
-                                }
-                                ui.add_space(10.0);
-                                note_line(ui, &self.note);
-                                ui.add_space(8.0);
-                            });
+                    Page::Config => {}
                     }
-                }
-            });
+                });
         }
 
-        if !is_home {
+        if self.page != Page::Config {
             self.draw_terminal_panel(ctx);
         }
 
@@ -2824,18 +3126,13 @@ impl eframe::App for App {
             .frame(
                 egui::Frame::new()
                     .fill(BG)
-                    .inner_margin(if is_home {
-                        egui::Margin::ZERO
-                    } else {
-                        egui::Margin::same(16)
-                    }),
+                    .inner_margin(egui::Margin::same(16)),
             )
             .show(ctx, |ui| {
                 match self.page {
-                    Page::Home => {}
+                    Page::Live => self.draw_live_view(ui),
                     Page::Stats => self.stats_main(ui),
-                    Page::Model => self.draw_library_grid(ui, ctx),
-                    _ => self.draw_live_view(ui),
+                    Page::Config => self.config_main(ui),
                 }
             });
     }
@@ -2901,22 +3198,95 @@ fn style(ctx: &egui::Context) {
     v.extreme_bg_color = Color32::from_rgb(44, 44, 46);
     ctx.set_visuals(v);
 
-    // A floating scrollbar draws on top of the sidebar text; give it its own
-    // column instead.
     ctx.style_mut(|s| {
-        s.spacing.scroll.floating = false;
-        s.spacing.scroll.bar_width = 6.0;
-        s.spacing.scroll.bar_inner_margin = 6.0;
+        s.spacing.scroll.floating = true;
+        s.spacing.scroll.bar_width = 0.0;
+        s.spacing.scroll.floating_width = 0.0;
+        s.spacing.scroll.floating_allocated_width = 0.0;
+        s.spacing.scroll.bar_inner_margin = 0.0;
         s.spacing.scroll.bar_outer_margin = 0.0;
+        s.spacing.scroll.dormant_background_opacity = 0.0;
+        s.spacing.scroll.active_background_opacity = 0.0;
+        s.spacing.scroll.interact_background_opacity = 0.0;
+        s.spacing.scroll.dormant_handle_opacity = 0.0;
+        s.spacing.scroll.active_handle_opacity = 0.0;
+        s.spacing.scroll.interact_handle_opacity = 0.0;
     });
+}
+
+fn scroll_y() -> egui::ScrollArea {
+    egui::ScrollArea::vertical()
+        // Touch on the Pi otherwise turns a tap into a scroll drag and
+        // Empty/Full never see clicked().
+        .drag_to_scroll(false)
+        .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
+}
+
+/// Top-bar play / pause. Green = start monitoring, red = stop.
+fn monitor_play_btn(ui: &mut egui::Ui, running: bool) -> egui::Response {
+    let size = 40.0;
+    let (rect, resp) = ui.allocate_exact_size(Vec2::splat(size), Sense::click());
+    let fill = if running { RED } else { GREEN };
+    let hover = if running {
+        Color32::from_rgb(255, 99, 88)
+    } else {
+        Color32::from_rgb(72, 225, 112)
+    };
+    ui.painter().circle_filled(
+        rect.center(),
+        size * 0.5,
+        if resp.hovered() { hover } else { fill },
+    );
+    let c = rect.center();
+    if running {
+        // Pause: two vertical bars
+        let bar_w = 4.0;
+        let bar_h = 14.0;
+        let gap = 5.0;
+        let y0 = c.y - bar_h * 0.5;
+        ui.painter().rect_filled(
+            egui::Rect::from_min_size(
+                Pos2::new(c.x - gap * 0.5 - bar_w, y0),
+                Vec2::new(bar_w, bar_h),
+            ),
+            CornerRadius::same(1),
+            Color32::WHITE,
+        );
+        ui.painter().rect_filled(
+            egui::Rect::from_min_size(
+                Pos2::new(c.x + gap * 0.5, y0),
+                Vec2::new(bar_w, bar_h),
+            ),
+            CornerRadius::same(1),
+            Color32::WHITE,
+        );
+    } else {
+        // Play: triangle pointing right
+        let left = c.x - 4.0;
+        let right = c.x + 7.0;
+        let top = c.y - 8.0;
+        let bot = c.y + 8.0;
+        ui.painter().add(egui::Shape::convex_polygon(
+            vec![
+                Pos2::new(left, top),
+                Pos2::new(right, c.y),
+                Pos2::new(left, bot),
+            ],
+            Color32::WHITE,
+            Stroke::NONE,
+        ));
+    }
+    resp.on_hover_text(if running {
+        "Stop monitoring"
+    } else {
+        "Start monitoring"
+    })
 }
 
 fn nav_bar(ui: &mut egui::Ui, page: &mut Page) {
     ui.spacing_mut().item_spacing = Vec2::ZERO;
     let items = [
-        (Page::Home, "Home"),
-        (Page::Live, "Live"),
-        (Page::Model, "Model"),
+        (Page::Live, "Home"),
         (Page::Stats, "Stats"),
         (Page::Config, "Config"),
     ];
@@ -2965,8 +3335,82 @@ fn nav_bar(ui: &mut egui::Ui, page: &mut Page) {
     }
 }
 
-fn pill(ui: &mut egui::Ui, text: &str) -> egui::Response {
-    centered_btn(ui, text, 14.0, TEXT, BTN, 20, Vec2::new(ui.available_width(), 40.0))
+#[derive(Clone, Copy)]
+enum LiveIcon {
+    Crop,
+    Cancel,
+    Clear,
+    Filter,
+}
+
+fn icon_btn(
+    ui: &mut egui::Ui,
+    side: f32,
+    on: bool,
+    icon: LiveIcon,
+    tip: &str,
+) -> egui::Response {
+    let (rect, resp) = ui.allocate_exact_size(Vec2::splat(side), Sense::click());
+    let fill = if on {
+        BLUE
+    } else if resp.hovered() {
+        Color32::from_rgb(58, 58, 60)
+    } else {
+        BTN
+    };
+    ui.painter()
+        .rect_filled(rect, CornerRadius::same(10), fill);
+    let ink = if on { Color32::WHITE } else { TEXT };
+    paint_live_icon(ui.painter(), rect.center(), icon, ink);
+    resp.on_hover_text(tip)
+}
+
+fn paint_live_icon(painter: &egui::Painter, c: Pos2, icon: LiveIcon, color: Color32) {
+    let s = Stroke::new(1.8_f32, color);
+    match icon {
+        LiveIcon::Crop => {
+            // Selection box — the watched region.
+            let r = egui::Rect::from_center_size(c, Vec2::splat(16.0));
+            painter.rect_stroke(r, CornerRadius::same(3), s, egui::StrokeKind::Inside);
+            painter.line_segment(
+                [Pos2::new(r.left() + 4.0, r.top()), Pos2::new(r.left() + 4.0, r.top() + 4.0)],
+                s,
+            );
+            painter.line_segment(
+                [Pos2::new(r.left(), r.top() + 4.0), Pos2::new(r.left() + 4.0, r.top() + 4.0)],
+                s,
+            );
+            painter.line_segment(
+                [Pos2::new(r.right() - 4.0, r.bottom()), Pos2::new(r.right() - 4.0, r.bottom() - 4.0)],
+                s,
+            );
+            painter.line_segment(
+                [Pos2::new(r.right(), r.bottom() - 4.0), Pos2::new(r.right() - 4.0, r.bottom() - 4.0)],
+                s,
+            );
+        }
+        LiveIcon::Cancel | LiveIcon::Clear => {
+            let d = 6.0;
+            painter.line_segment(
+                [Pos2::new(c.x - d, c.y - d), Pos2::new(c.x + d, c.y + d)],
+                s,
+            );
+            painter.line_segment(
+                [Pos2::new(c.x + d, c.y - d), Pos2::new(c.x - d, c.y + d)],
+                s,
+            );
+        }
+        LiveIcon::Filter => {
+            // Three sliders — the processed filter view.
+            for (i, knob) in [0.28_f32, 0.68, 0.45].iter().enumerate() {
+                let y = c.y - 7.0 + i as f32 * 7.0;
+                let x0 = c.x - 8.0;
+                let x1 = c.x + 8.0;
+                painter.line_segment([Pos2::new(x0, y), Pos2::new(x1, y)], s);
+                painter.circle_filled(Pos2::new(x0 + knob * 16.0, y), 2.6, color);
+            }
+        }
+    }
 }
 
 fn pill_accent(ui: &mut egui::Ui, text: &str) -> egui::Response {
@@ -2978,6 +3422,32 @@ fn pill_accent(ui: &mut egui::Ui, text: &str) -> egui::Response {
         BLUE,
         20,
         Vec2::new(ui.available_width(), 40.0),
+    )
+}
+
+/// Home continuous-learning tap target (full width, tall enough for touch).
+fn feedback_pill(ui: &mut egui::Ui, text: &str, fill: Color32) -> egui::Response {
+    centered_btn(
+        ui,
+        text,
+        16.0,
+        Color32::WHITE,
+        fill,
+        10,
+        Vec2::new(ui.available_width(), 48.0),
+    )
+}
+
+fn config_action_btn(ui: &mut egui::Ui, text: &str, accent: bool) -> egui::Response {
+    let w = (text.len() as f32 * 7.5 + 28.0).clamp(72.0, 180.0);
+    centered_btn(
+        ui,
+        text,
+        13.0,
+        if accent { Color32::WHITE } else { TEXT },
+        if accent { BLUE } else { BTN },
+        8,
+        Vec2::new(w, 32.0),
     )
 }
 
@@ -3065,12 +3535,28 @@ fn sync_reference(cloud: Option<&Supabase>, local: Option<Reference>) -> Option<
     }
 }
 
+fn line_lamp(ui: &mut egui::Ui) {
+    ui.horizontal(|ui| {
+        ui.label(RichText::new("Line").size(13.0).color(MUTED));
+        let (rect, _) = ui.allocate_exact_size(Vec2::splat(14.0), Sense::hover());
+        let color = match silo_alert::line_lamp() {
+            silo_alert::LineLamp::Tx => RED,
+            silo_alert::LineLamp::Busy => BLUE,
+            silo_alert::LineLamp::Off => Color32::TRANSPARENT,
+        };
+        if color != Color32::TRANSPARENT {
+            ui.painter().circle_filled(rect.center(), 5.5, color);
+        }
+    })
+    .response
+    .on_hover_text("Blue = channel busy (SPKEN). Red = this Pi is transmitting. Dark = clear.");
+}
+
 fn row_stat(ui: &mut egui::Ui, k: &str, v: &str) {
     ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 12.0;
         ui.label(RichText::new(k).size(13.0).color(MUTED));
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            ui.label(RichText::new(v).size(13.0).color(TEXT));
-        });
+        ui.label(RichText::new(v).size(13.0).color(TEXT));
     });
     ui.add_space(6.0);
 }
@@ -3085,6 +3571,38 @@ fn field_label(ui: &mut egui::Ui, label: &str, tip: &str) {
                 .on_hover_text(tip);
         }
     });
+}
+
+/// Fixed-size Config text field with a stable id so focus/typing stay reliable.
+fn config_text_field(
+    ui: &mut egui::Ui,
+    id: &str,
+    value: &mut String,
+    hint: &str,
+    password: bool,
+) -> egui::Response {
+    let height = ui.spacing().interact_size.y.max(28.0);
+    let resp = ui
+        .allocate_ui_with_layout(
+            Vec2::new(CONFIG_FIELD_W, height),
+            egui::Layout::left_to_right(egui::Align::Center),
+            |ui| {
+                ui.add(
+                    egui::TextEdit::singleline(value)
+                        .id_source(id)
+                        .desired_width(CONFIG_FIELD_W)
+                        .frame(true)
+                        .password(password)
+                        .hint_text(hint)
+                        .clip_text(true),
+                )
+            },
+        )
+        .inner;
+    if resp.clicked() && !resp.has_focus() {
+        resp.request_focus();
+    }
+    resp
 }
 
 fn note_line(ui: &mut egui::Ui, note: &str) {
@@ -3146,12 +3664,53 @@ fn labeled_slider(
     unit: &str,
 ) {
     field_label(ui, label, tip);
-    ui.add(egui::Slider::new(value, range).suffix(format!(" {unit}")));
+    ui.allocate_ui_with_layout(
+        Vec2::new(CONFIG_FIELD_W, ui.spacing().interact_size.y),
+        egui::Layout::left_to_right(egui::Align::Center),
+        |ui| {
+            ui.add(egui::Slider::new(value, range).suffix(format!(" {unit}")));
+        },
+    );
     ui.add_space(6.0);
 }
 
-
-
+fn live_host_stats(ui: &mut egui::Ui, snap: Option<&HostSnapshot>) {
+    let Some(s) = snap else {
+        row_stat(ui, "Temp", "—");
+        row_stat(ui, "CPU", "—");
+        row_stat(ui, "RAM", "—");
+        row_stat(ui, "Power", "—");
+        return;
+    };
+    row_stat(
+        ui,
+        "Temp",
+        &s.temp_c
+            .map(|t| format!("{t:.0}°C"))
+            .unwrap_or_else(|| "—".into()),
+    );
+    row_stat(
+        ui,
+        "CPU",
+        &s.cpu
+            .map(|c| format!("{:.0}%", c * 100.0))
+            .unwrap_or_else(|| "—".into()),
+    );
+    row_stat(
+        ui,
+        "RAM",
+        &s.ram_used_gb()
+            .map(|(u, t)| format!("{u:.1} / {t:.1} GB"))
+            .unwrap_or_else(|| "—".into()),
+    );
+    row_stat(
+        ui,
+        "Power",
+        &s.throttled
+            .map(host::live_power_label)
+            .unwrap_or_else(|| "—".into()),
+    );
+}
 
 /// A thin horizontal bar, 0..1.
 fn meter(ui: &mut egui::Ui, value: f32, color: Color32) {
@@ -3170,16 +3729,16 @@ fn quiet_btn(ui: &mut egui::Ui, text: &str) -> egui::Response {
     centered_btn(ui, text, 13.0, TEXT, BTN, 8, Vec2::new(64.0, 30.0))
 }
 
-fn filter_chip(ui: &mut egui::Ui, text: &str, on: bool) -> egui::Response {
-    let w = (text.len() as f32 * 7.5 + 20.0).clamp(56.0, 100.0);
+fn config_tab_btn(ui: &mut egui::Ui, text: &str, on: bool) -> egui::Response {
+    let w = ui.available_width();
     centered_btn(
         ui,
         text,
-        12.0,
+        13.0,
         if on { Color32::WHITE } else { MUTED },
         if on { BLUE } else { BTN },
         8,
-        Vec2::new(w, 28.0),
+        Vec2::new(w, 36.0),
     )
 }
 
@@ -3198,6 +3757,56 @@ fn fmt_ms(ms: Option<u64>) -> String {
         return "—".into();
     };
     fmt_dt(ms / 1000)
+}
+
+fn truncate_chars(s: &str, max: usize) -> String {
+    let mut it = s.chars();
+    let head: String = it.by_ref().take(max).collect();
+    if it.next().is_some() {
+        format!("{head}…")
+    } else {
+        head
+    }
+}
+
+fn draw_preview_pane(
+    ui: &mut egui::Ui,
+    tex: Option<&egui::TextureHandle>,
+    title: &str,
+    w: f32,
+    h: f32,
+) {
+    ui.vertical(|ui| {
+        ui.label(RichText::new(title).size(12.0).color(MUTED));
+        ui.add_space(4.0);
+        let (rect, _) = ui.allocate_exact_size(Vec2::new(w, h), Sense::hover());
+        ui.painter()
+            .rect_filled(rect, CornerRadius::same(10), VIDEO_BG);
+        if let Some(tex) = tex {
+            let size = tex.size_vec2();
+            let scale = (rect.width() / size.x)
+                .min(rect.height() / size.y)
+                .max(0.01);
+            let draw = size * scale;
+            let img_rect = egui::Rect::from_center_size(rect.center(), draw);
+            let uv = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
+            ui.painter().image(tex.id(), img_rect, uv, Color32::WHITE);
+        } else {
+            ui.painter().text(
+                rect.center(),
+                egui::Align2::CENTER_CENTER,
+                "No preview",
+                egui::FontId::proportional(13.0),
+                MUTED,
+            );
+        }
+        ui.painter().rect_stroke(
+            rect,
+            CornerRadius::same(10),
+            Stroke::new(1.0_f32, HAIRLINE),
+            egui::StrokeKind::Inside,
+        );
+    });
 }
 
 fn fmt_dt(unix: u64) -> String {
@@ -3280,19 +3889,6 @@ fn line_chart(ui: &mut egui::Ui, values: &[u32], bucket_secs: u64) {
 }
 
 /// Tell systemd the plant loop is still running. No-op outside the service.
-fn read_throttled() -> Option<u32> {
-    let output = std::process::Command::new("vcgencmd")
-        .arg("get_throttled")
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let text = String::from_utf8_lossy(&output.stdout);
-    let hex = text.split('=').nth(1)?.trim().trim_start_matches("0x");
-    u32::from_str_radix(hex, 16).ok()
-}
-
 fn pet_watchdog() {
     use std::sync::Mutex;
     static LAST: Mutex<Option<Instant>> = Mutex::new(None);
@@ -3340,6 +3936,7 @@ fn main() -> eframe::Result {
     // First ping before camera and cloud setup, so a slow start still
     // fits inside WatchdogSec.
     sd_notify("WATCHDOG=1");
+    // Use X11/Xwayland. Native Wayland can freeze the pointer under labwc + Pi Connect.
     if std::env::var_os("WINIT_UNIX_BACKEND").is_none() {
         unsafe { std::env::set_var("WINIT_UNIX_BACKEND", "x11") };
     }
@@ -3349,6 +3946,13 @@ fn main() -> eframe::Result {
         let cfg = Config::load();
         silo_alert::set_ptt_pin(cfg.radio.ptt_gpio);
         silo_alert::set_spken_pin(cfg.radio.spken_gpio);
+        silo_alert::set_channel_pins(
+            cfg.radio.ch_bit1_gpio,
+            cfg.radio.ch_bit2_gpio,
+            cfg.radio.ch_bit4_gpio,
+            cfg.radio.ch_bit8_gpio,
+        );
+        let _ = silo_alert::select_channel(cfg.radio.channel);
     }
 
     // Headless check of the exact path the Test radio button uses.
@@ -3384,14 +3988,25 @@ fn main() -> eframe::Result {
                     None
                 }
             };
-            eprintln!("opening Industrial Smart System");
+            let backend = std::env::var("WINIT_UNIX_BACKEND").unwrap_or_else(|_| "?".into());
+            eprintln!("opening Industrial Smart System (backend={backend})");
             match eframe::run_native(
                 "Industrial Smart System",
                 opts.clone(),
                 Box::new(move |_cc| Ok(Box::new(App::new(cam)))),
             ) {
                 Ok(()) => eprintln!("gui closed — plant keeps running"),
-                Err(e) => eprintln!("gui failed — plant keeps running: {e}"),
+                Err(e) => {
+                    eprintln!("gui failed — plant keeps running: {e}");
+                    // Wayland can fail on some sessions; fall back to X11/Xwayland.
+                    if std::env::var_os("WINIT_UNIX_BACKEND").as_deref()
+                        == Some(std::ffi::OsStr::new("wayland"))
+                        && x11_ready()
+                    {
+                        eprintln!("gui: falling back to X11 backend");
+                        unsafe { std::env::set_var("WINIT_UNIX_BACKEND", "x11") };
+                    }
+                }
             }
             if started.elapsed() < Duration::from_secs(3) {
                 std::thread::sleep(Duration::from_secs(3));
@@ -3401,8 +4016,28 @@ fn main() -> eframe::Result {
     }
 }
 
-/// True when an X server socket is present for `$DISPLAY`.
+/// True when a Wayland or X11 display socket is available for the operator UI.
 fn display_ready() -> bool {
+    wayland_ready() || x11_ready()
+}
+
+fn wayland_ready() -> bool {
+    let Some(name) = std::env::var_os("WAYLAND_DISPLAY") else {
+        // systemd may not pass WAYLAND_DISPLAY; labwc default socket.
+        return std::path::Path::new("/run/user/1000/wayland-0").exists();
+    };
+    if name.is_empty() {
+        return false;
+    }
+    let name = name.to_string_lossy();
+    if std::path::Path::new(name.as_ref()).is_absolute() {
+        return std::path::Path::new(name.as_ref()).exists();
+    }
+    let runtime = std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/run/user/1000".into());
+    std::path::Path::new(&runtime).join(name.as_ref()).exists()
+}
+
+fn x11_ready() -> bool {
     let display = std::env::var("DISPLAY").unwrap_or_else(|_| ":0".into());
     let n = display
         .trim_start_matches(':')

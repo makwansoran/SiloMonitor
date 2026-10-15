@@ -1,6 +1,7 @@
 //! Push and pull silo data via Supabase PostgREST.
 //!
 //! Each fact has its own table (`silo_empty`, `silo_full`, `silo_radio_tx`, …).
+//! Empty alerts store `ts` + `image_path` (JPEG under `silo-frames/{site}/alerts/`).
 //! Heartbeat, power, camera and arming rows are deleted after 30 days.
 //! Stills go to Storage (`silo-frames`).
 //!
@@ -25,13 +26,14 @@ const OUTBOX_MAX: usize = 2000;
 const FLUSH_EVERY: Duration = Duration::from_secs(2);
 const BACKOFF_MAX: Duration = Duration::from_secs(60);
 const MISSING_LOG_EVERY: Duration = Duration::from_secs(60);
-const SQL_HINT: &str = "run sql/supabase_silo.sql in the Supabase SQL Editor";
+const SQL_HINT: &str = "run sql/silo_empty_images.sql (and sql/silo_reference_images.sql if needed) in the Supabase SQL Editor";
 const SQL_EDITOR: &str =
     "https://supabase.com/dashboard/project/mranicltlsnjurjqwjpv/sql/new";
 const FRAME_BUCKET: &str = "silo-frames";
 
 static PENDING: AtomicUsize = AtomicUsize::new(0);
 static SCHEMA_MISSING: AtomicBool = AtomicBool::new(false);
+static REF_TABLE_WARNED: AtomicBool = AtomicBool::new(false);
 static LAST_ERROR: Mutex<Option<String>> = Mutex::new(None);
 
 /// Rows still waiting to reach Supabase.
@@ -101,12 +103,15 @@ impl Supabase {
         &self.site_id
     }
 
+    /// Record an empty alert: timestamp + Storage path for the evidence JPEG.
     pub fn push_empty_alert(&self, unix_secs: u64) {
+        let image_path = self.alert_frame_path(unix_secs);
         self.enqueue(
             "silo_empty",
-            &When {
+            &EmptyAlertRow {
                 site_id: &self.site_id,
                 ts: unix_to_rfc3339(unix_secs),
+                image_path: &image_path,
             },
         );
     }
@@ -205,28 +210,22 @@ impl Supabase {
         let key = self.key.clone();
         let content_type = content_type.to_string();
         thread::spawn(move || {
-            match ureq::put(&url)
-                .set("apikey", &key)
-                .set("Authorization", &format!("Bearer {key}"))
-                .set("Content-Type", &content_type)
-                .set("x-upsert", "true")
-                .timeout(Duration::from_secs(20))
-                .send_bytes(&bytes)
-            {
-                Ok(resp) => {
-                    let status = resp.status();
-                    if !(200..300).contains(&status) {
-                        eprintln!("supabase storage: HTTP {status} for {url}");
-                    }
-                }
-                Err(ureq::Error::Status(code, resp)) => {
-                    let body = resp.into_string().unwrap_or_default();
-                    let snippet: String = body.chars().take(120).collect();
-                    eprintln!("supabase storage: HTTP {code} {snippet}");
-                }
-                Err(e) => eprintln!("supabase storage: {e}"),
-            }
+            put_storage(&url, &key, &content_type, &bytes);
         });
+    }
+
+    /// Blocking Storage PUT — used when metadata must follow the file.
+    fn upload_bytes_blocking(&self, object_path: &str, bytes: &[u8], content_type: &str) {
+        if bytes.is_empty() || object_path.is_empty() {
+            return;
+        }
+        let url = format!(
+            "{}/storage/v1/object/{}/{}",
+            self.base,
+            FRAME_BUCKET,
+            object_path.trim_start_matches('/')
+        );
+        put_storage(&url, &self.key, content_type, bytes);
     }
 
     /// Read one object back from Storage.
@@ -273,6 +272,193 @@ impl Supabase {
         format!("{}/empty/{file_name}", self.site_id)
     }
 
+    /// Colour JPEG path for a labeled reference photo.
+    pub fn reference_colour_path(&self, file_name: &str, empty: bool) -> String {
+        let folder = if empty { "empty" } else { "full" };
+        format!("{}/{folder}/{file_name}", self.site_id)
+    }
+
+    /// B&W twin path for a reference photo.
+    pub fn reference_bw_path(&self, file_name: &str) -> String {
+        format!("{}/empty_bw/{file_name}", self.site_id)
+    }
+
+    /// Upload one reference photo (colour + B&W) and upsert its metadata row.
+    pub fn sync_reference_image(&self, meta: &crate::vision::SampleMeta) {
+        let empty = meta.label_empty != Some(false);
+        let label = if empty { "empty" } else { "not_empty" };
+        let colour_path = self.reference_colour_path(&meta.file_name, empty);
+        let bw_path = self.reference_bw_path(&meta.file_name);
+        let Ok(colour) = fs::read(&meta.path) else {
+            eprintln!("supabase: missing colour {}", meta.path.display());
+            return;
+        };
+        let (width, height) = jpeg_size(&colour).unwrap_or((0, 0));
+        self.upload_bytes_blocking(&colour_path, &colour, "image/jpeg");
+
+        let bw_file = crate::vision::bw_path_for(&meta.file_name);
+        let bw_storage = if bw_file.is_file() {
+            if let Ok(bytes) = fs::read(&bw_file) {
+                self.upload_bytes_blocking(&bw_path, &bytes, "image/jpeg");
+                Some(bw_path.clone())
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        // Remove the colour object from the other label folder so relabel stays clean.
+        let other = self.reference_colour_path(&meta.file_name, !empty);
+        let _ = ureq::delete(&format!(
+            "{}/storage/v1/object/{}/{}",
+            self.base,
+            FRAME_BUCKET,
+            other.trim_start_matches('/')
+        ))
+        .set("apikey", &self.key)
+        .set("Authorization", &format!("Bearer {}", self.key))
+        .timeout(Duration::from_secs(15))
+        .call();
+
+        self.upsert_reference_image_blocking(&ReferenceImageRow {
+            site_id: &self.site_id,
+            file_name: &meta.file_name,
+            label,
+            captured_ms: meta.captured_ms,
+            bytes: Some(meta.bytes as i64),
+            width: if width > 0 { Some(width as i32) } else { None },
+            height: if height > 0 { Some(height as i32) } else { None },
+            colour_path: &colour_path,
+            bw_path: bw_storage.as_deref(),
+            updated_at: now_rfc3339(),
+        });
+    }
+
+    /// Push every local Empty / Not empty photo + metadata to Supabase.
+    pub fn sync_all_reference_images(&self) {
+        let site = self.clone();
+        thread::spawn(move || {
+            let samples = crate::vision::list_references();
+            eprintln!(
+                "supabase: syncing {} reference images to storage + silo_reference_images",
+                samples.len()
+            );
+            for meta in &samples {
+                site.sync_reference_image(meta);
+            }
+            eprintln!("supabase: reference image sync finished ({})", samples.len());
+        });
+    }
+
+    /// Drop a reference photo from Storage and the metadata table.
+    pub fn delete_reference_image(&self, file_name: &str) {
+        if file_name.is_empty() {
+            return;
+        }
+        self.delete_storage_object(&self.reference_colour_path(file_name, true));
+        self.delete_storage_object(&self.reference_colour_path(file_name, false));
+        self.delete_storage_object(&self.reference_bw_path(file_name));
+        let url = format!(
+            "{}/rest/v1/silo_reference_images?site_id=eq.{}&file_name=eq.{}",
+            self.base,
+            urlencoding_site(&self.site_id),
+            query_escape(file_name)
+        );
+        let key = self.key.clone();
+        thread::spawn(move || {
+            match ureq::delete(&url)
+                .set("apikey", &key)
+                .set("Authorization", &format!("Bearer {key}"))
+                .set("Prefer", "return=minimal")
+                .timeout(Duration::from_secs(15))
+                .call()
+            {
+                Ok(resp) if (200..300).contains(&resp.status()) => {}
+                Ok(resp) => eprintln!(
+                    "supabase: delete silo_reference_images HTTP {}",
+                    resp.status()
+                ),
+                Err(ureq::Error::Status(code, resp)) => {
+                    let body = resp.into_string().unwrap_or_default();
+                    if is_missing_table(code, &body) {
+                        SCHEMA_MISSING.store(true, Ordering::Relaxed);
+                        eprintln!("supabase: silo_reference_images missing — {SQL_HINT}");
+                    } else {
+                        let snippet: String = body.chars().take(120).collect();
+                        eprintln!("supabase: delete silo_reference_images HTTP {code} {snippet}");
+                    }
+                }
+                Err(e) => eprintln!("supabase: delete silo_reference_images {e}"),
+            }
+        });
+    }
+
+    fn delete_storage_object(&self, object_path: &str) {
+        if object_path.is_empty() {
+            return;
+        }
+        let url = format!(
+            "{}/storage/v1/object/{}/{}",
+            self.base,
+            FRAME_BUCKET,
+            object_path.trim_start_matches('/')
+        );
+        let key = self.key.clone();
+        thread::spawn(move || {
+            let _ = ureq::delete(&url)
+                .set("apikey", &key)
+                .set("Authorization", &format!("Bearer {key}"))
+                .timeout(Duration::from_secs(15))
+                .call();
+        });
+    }
+
+    fn upsert_reference_image_blocking(&self, row: &ReferenceImageRow<'_>) {
+        let Ok(body) = serde_json::to_string(row) else {
+            return;
+        };
+        let url = format!(
+            "{}/rest/v1/silo_reference_images?on_conflict=site_id,file_name",
+            self.base
+        );
+        match ureq::post(&url)
+            .set("apikey", &self.key)
+            .set("Authorization", &format!("Bearer {}", self.key))
+            .set("Content-Type", "application/json")
+            .set("Prefer", "resolution=merge-duplicates,return=minimal")
+            .timeout(Duration::from_secs(20))
+            .send_string(&body)
+        {
+            Ok(resp) if (200..300).contains(&resp.status()) => {
+                SCHEMA_MISSING.store(false, Ordering::Relaxed);
+            }
+            Ok(resp) => {
+                eprintln!(
+                    "supabase: silo_reference_images upsert HTTP {}",
+                    resp.status()
+                );
+            }
+            Err(ureq::Error::Status(code, resp)) => {
+                let text = resp.into_string().unwrap_or_default();
+                if is_missing_table(code, &text) {
+                    SCHEMA_MISSING.store(true, Ordering::Relaxed);
+                    set_error(Some(format!(
+                        "silo_reference_images missing — {SQL_HINT}"
+                    )));
+                    if !REF_TABLE_WARNED.swap(true, Ordering::Relaxed) {
+                        eprintln!("supabase: silo_reference_images missing — {SQL_HINT}");
+                        eprintln!("supabase: {SQL_EDITOR}");
+                    }
+                } else {
+                    let snippet: String = text.chars().take(160).collect();
+                    eprintln!("supabase: silo_reference_images HTTP {code} {snippet}");
+                }
+            }
+            Err(e) => eprintln!("supabase: silo_reference_images {e}"),
+        }
+    }
+
     /// Drop machine logs older than 30 days. Empty, full and radio stay.
     pub fn purge_expired_logs(&self) {
         let cutoff = now_unix().saturating_sub(30 * 24 * 60 * 60);
@@ -317,6 +503,87 @@ impl Supabase {
         Ok(out)
     }
 
+    /// Fill NULL `image_path` on existing `silo_empty` rows from `{site}/alerts/{unix}.jpg`.
+    /// Needs the UPDATE policy from `sql/silo_empty_images.sql`.
+    pub fn backfill_empty_image_paths(&self) {
+        let site = self.site_id.clone();
+        let base = self.base.clone();
+        let key = self.key.clone();
+        thread::spawn(move || {
+            let url = format!(
+                "{base}/rest/v1/silo_empty?select=id,ts,image_path&site_id=eq.{}&image_path=is.null&order=ts.desc&limit=500",
+                urlencoding_site(&site)
+            );
+            let rows: Vec<EmptyIdRow> = match get_json(&url, &key) {
+                Ok(r) => r,
+                Err(e) => {
+                    eprintln!("supabase: image_path backfill list failed: {e}");
+                    return;
+                }
+            };
+            if rows.is_empty() {
+                return;
+            }
+            let mut ok = 0u32;
+            let mut fail = 0u32;
+            for row in &rows {
+                let Some(unix) = parse_rfc3339_unix(&row.ts) else {
+                    fail += 1;
+                    continue;
+                };
+                let image_path = format!("{site}/alerts/{unix}.jpg");
+                let patch_url = format!("{base}/rest/v1/silo_empty?id=eq.{}", row.id);
+                let body = serde_json::json!({ "image_path": image_path }).to_string();
+                match ureq::request("PATCH", &patch_url)
+                    .set("apikey", &key)
+                    .set("Authorization", &format!("Bearer {key}"))
+                    .set("Content-Type", "application/json")
+                    .set("Prefer", "return=representation")
+                    .timeout(Duration::from_secs(15))
+                    .send_string(&body)
+                {
+                    Ok(resp) if (200..300).contains(&resp.status()) => {
+                        let text = resp.into_string().unwrap_or_default();
+                        // RLS can return 200 with [] when zero rows were updated.
+                        if text.trim_start().starts_with('[') && !text.contains("\"id\"") {
+                            fail += 1;
+                            if fail == 1 {
+                                eprintln!(
+                                    "supabase: image_path backfill blocked by RLS — run sql/silo_empty_images.sql"
+                                );
+                            }
+                        } else {
+                            ok += 1;
+                        }
+                    }
+                    Ok(resp) => {
+                        fail += 1;
+                        eprintln!(
+                            "supabase: image_path backfill HTTP {} — run sql/silo_empty_images.sql",
+                            resp.status()
+                        );
+                    }
+                    Err(ureq::Error::Status(code, resp)) => {
+                        fail += 1;
+                        let text = resp.into_string().unwrap_or_default();
+                        let snippet: String = text.chars().take(120).collect();
+                        eprintln!(
+                            "supabase: image_path backfill HTTP {code} {snippet} — run sql/silo_empty_images.sql"
+                        );
+                    }
+                    Err(e) => {
+                        fail += 1;
+                        eprintln!("supabase: image_path backfill {e}");
+                    }
+                }
+            }
+            eprintln!(
+                "supabase: image_path backfill done ok={ok} fail={fail} (of {} null rows)",
+                rows.len()
+            );
+        });
+    }
+
     fn enqueue<T: Serialize>(&self, table: &str, row: &T) {
         let Ok(body) = serde_json::to_string(row) else {
             return;
@@ -338,6 +605,15 @@ impl Supabase {
 #[derive(Deserialize)]
 struct TsRow {
     ts: String,
+}
+
+#[derive(Deserialize)]
+struct EmptyIdRow {
+    id: i64,
+    ts: String,
+    #[serde(default)]
+    #[allow(dead_code)]
+    image_path: Option<String>,
 }
 
 fn urlencoding_site(site: &str) -> String {
@@ -516,6 +792,12 @@ fn classify(status: u16, body: &str) -> SendOutcome {
         return SendOutcome::Missing;
     }
     let snippet: String = body.chars().take(160).collect();
+    // Column not migrated yet — keep the row queued until SQL is applied.
+    if is_missing_column(status, body) {
+        return SendOutcome::Retry(format!(
+            "column missing — {SQL_HINT} ({snippet})"
+        ));
+    }
     if status == 429 || (500..600).contains(&status) {
         return SendOutcome::Retry(format!("HTTP {status} {snippet}"));
     }
@@ -526,6 +808,13 @@ fn classify(status: u16, body: &str) -> SendOutcome {
         return SendOutcome::Drop(format!("HTTP {status} {snippet}"));
     }
     SendOutcome::Retry(format!("HTTP {status} {snippet}"))
+}
+
+fn is_missing_column(status: u16, body: &str) -> bool {
+    (status == 400 || status == 404)
+        && (body.contains("PGRST204")
+            || body.contains("Could not find the")
+            || body.contains("image_path"))
 }
 
 fn is_missing_table(status: u16, body: &str) -> bool {
@@ -606,6 +895,13 @@ struct When<'a> {
 }
 
 #[derive(Serialize)]
+struct EmptyAlertRow<'a> {
+    site_id: &'a str,
+    ts: String,
+    image_path: &'a str,
+}
+
+#[derive(Serialize)]
 struct WhenEmpty<'a> {
     site_id: &'a str,
     ts: String,
@@ -639,6 +935,83 @@ struct HeartbeatRow<'a> {
     alerts_sent: u64,
     labels_empty: u64,
     labels_full: u64,
+}
+
+#[derive(Serialize)]
+struct ReferenceImageRow<'a> {
+    site_id: &'a str,
+    file_name: &'a str,
+    label: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    captured_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    bytes: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    width: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    height: Option<i32>,
+    colour_path: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    bw_path: Option<&'a str>,
+    updated_at: String,
+}
+
+fn put_storage(url: &str, key: &str, content_type: &str, bytes: &[u8]) {
+    match ureq::put(url)
+        .set("apikey", key)
+        .set("Authorization", &format!("Bearer {key}"))
+        .set("Content-Type", content_type)
+        .set("x-upsert", "true")
+        .timeout(Duration::from_secs(30))
+        .send_bytes(bytes)
+    {
+        Ok(resp) => {
+            let status = resp.status();
+            if !(200..300).contains(&status) {
+                eprintln!("supabase storage: HTTP {status} for {url}");
+            }
+        }
+        Err(ureq::Error::Status(code, resp)) => {
+            let body = resp.into_string().unwrap_or_default();
+            let snippet: String = body.chars().take(120).collect();
+            eprintln!("supabase storage: HTTP {code} {snippet}");
+        }
+        Err(e) => eprintln!("supabase storage: {e}"),
+    }
+}
+
+/// Read SOF0/SOF2 dimensions from a JPEG without a full decode.
+fn jpeg_size(bytes: &[u8]) -> Option<(u32, u32)> {
+    if bytes.len() < 4 || bytes[0] != 0xFF || bytes[1] != 0xD8 {
+        return None;
+    }
+    let mut i = 2usize;
+    while i + 9 < bytes.len() {
+        if bytes[i] != 0xFF {
+            i += 1;
+            continue;
+        }
+        let marker = bytes[i + 1];
+        i += 2;
+        if marker == 0xD8 || marker == 0xD9 {
+            continue;
+        }
+        if i + 2 > bytes.len() {
+            break;
+        }
+        let seglen = u16::from_be_bytes([bytes[i], bytes[i + 1]]) as usize;
+        if seglen < 2 || i + seglen > bytes.len() {
+            break;
+        }
+        // SOF0 / SOF2
+        if matches!(marker, 0xC0 | 0xC2) && seglen >= 7 {
+            let h = u16::from_be_bytes([bytes[i + 3], bytes[i + 4]]) as u32;
+            let w = u16::from_be_bytes([bytes[i + 5], bytes[i + 6]]) as u32;
+            return Some((w, h));
+        }
+        i += seglen;
+    }
+    None
 }
 
 fn now_rfc3339() -> String {

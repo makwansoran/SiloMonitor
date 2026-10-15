@@ -37,7 +37,7 @@ impl RtspCam {
     fn open(url: &str, width: u32, height: u32, fps: u32) -> Result<Self, String> {
         let width = width.max(160);
         let height = height.max(120);
-        let fps = fps.clamp(1, 15);
+        let fps = fps.clamp(1, 25);
 
         let mut child = Command::new("ffmpeg")
             .args([

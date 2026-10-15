@@ -6,9 +6,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 pub const SIZE: u32 = 32;
 pub const EMPTY_DIR: &str = "data/empty";
+/// Photos marked Not empty (kept for review; not used in the empty match set).
+pub const FULL_DIR: &str = "data/full";
 /// The black-and-white version of each reference photo.
 pub const BW_DIR: &str = "data/empty_bw";
-pub const FULL_DIR: &str = "data/full";
 pub const ALERTS_DIR: &str = "data/alerts";
 pub const REGION_PATH: &str = "data/region.json";
 pub const REFERENCE_PATH: &str = "data/reference.json";
@@ -70,18 +71,20 @@ pub fn save_region(region: Option<BoxNorm>) {
     }
 }
 
-/// What the app compares every frame against: a handful of pictures of the
-/// silo when it is empty.
-///
-/// There is no second class. A frame either looks like the empty silo or it
-/// does not, and "how alike" is a plain percentage the operator can read.
+/// What the app compares every frame against: empty-silo photos, plus optional
+/// "full" photos from continuous feedback that reject false empties.
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Reference {
-    /// One feature vector per reference photo.
+    /// One feature vector per empty reference photo.
     pub frames: Vec<Vec<f32>>,
     /// The same photos in black and white, matched by index.
     #[serde(default)]
     pub frames_bw: Vec<Vec<f32>>,
+    /// Feature vectors from Not empty / Full photos (continuous learning).
+    #[serde(default)]
+    pub negatives: Vec<Vec<f32>>,
+    #[serde(default)]
+    pub negatives_bw: Vec<Vec<f32>>,
     pub roi: Option<BoxNorm>,
     /// Lowest similarity between two reference photos — how much the empty
     /// silo varies from one picture to the next.
@@ -115,21 +118,17 @@ impl Reference {
         self.frames.len()
     }
 
-    /// 0..1, how closely this frame matches the closest reference.
+    /// 0..1, how closely this frame matches the closest empty reference.
     ///
     /// The plain picture and its black-and-white version are weighed equally:
     /// one carries brightness and texture, the other shape and shadow.
     pub fn similarity_pair(&self, feat: &[f32], feat_bw: &[f32]) -> f32 {
-        let mut best = 0.0f32;
-        for (i, r) in self.frames.iter().enumerate() {
-            let gray = similarity(feat, r);
-            let score = match self.frames_bw.get(i) {
-                Some(rbw) => 0.5 * gray + 0.5 * similarity(feat_bw, rbw),
-                None => gray,
-            };
-            best = best.max(score);
-        }
-        best
+        best_pair_score(feat, feat_bw, &self.frames, &self.frames_bw)
+    }
+
+    /// 0..1, how closely this frame matches the closest Full / Not empty photo.
+    pub fn negative_similarity_pair(&self, feat: &[f32], feat_bw: &[f32]) -> f32 {
+        best_pair_score(feat, feat_bw, &self.negatives, &self.negatives_bw)
     }
 
     /// Match on the plain picture only, for stored photos shown in the UI.
@@ -202,6 +201,24 @@ pub fn similarity(a: &[f32], b: &[f32]) -> f32 {
     (1.0 - mse.sqrt()).clamp(0.0, 1.0)
 }
 
+fn best_pair_score(
+    feat: &[f32],
+    feat_bw: &[f32],
+    frames: &[Vec<f32>],
+    frames_bw: &[Vec<f32>],
+) -> f32 {
+    let mut best = 0.0f32;
+    for (i, r) in frames.iter().enumerate() {
+        let gray = similarity(feat, r);
+        let score = match frames_bw.get(i) {
+            Some(rbw) => 0.5 * gray + 0.5 * similarity(feat_bw, rbw),
+            None => gray,
+        };
+        best = best.max(score);
+    }
+    best
+}
+
 /// Read every reference photo and build the comparison set from them.
 ///
 /// The black-and-white twin is regenerated here rather than read from disk,
@@ -214,7 +231,7 @@ pub fn build_reference() -> Result<Reference, String> {
     let mut frames_bw = Vec::new();
     let mut bw_threshold = default_bw_threshold();
     let mut first = true;
-    for meta in list_references() {
+    for meta in list_empty_references() {
         let img = match image::open(&meta.path) {
             Ok(i) => i.to_rgb8(),
             Err(_) => continue,
@@ -242,8 +259,22 @@ pub fn build_reference() -> Result<Reference, String> {
         return Err("add at least one photo of the empty silo".into());
     }
 
-    // How alike are the references themselves? That sets the bar for what
-    // counts as a match, without needing any "not empty" examples.
+    // Full / Not empty photos reject false empties during live checks.
+    let mut negatives = Vec::new();
+    let mut negatives_bw = Vec::new();
+    for meta in samples_in(FULL_DIR, Some(false)) {
+        let img = match image::open(&meta.path) {
+            Ok(i) => i.to_rgb8(),
+            Err(_) => continue,
+        };
+        let (w, h) = img.dimensions();
+        let rgb = img.into_raw();
+        negatives.push(features_in_roi(w, h, &rgb, roi));
+        negatives_bw.push(bw_features(w, h, &rgb, roi, Some(bw_threshold)));
+    }
+
+    // How alike are the empty references themselves? That sets the bar for
+    // what counts as a match.
     let cohesion = if frames.len() < 2 {
         0.97
     } else {
@@ -263,6 +294,8 @@ pub fn build_reference() -> Result<Reference, String> {
     let reference = Reference {
         frames,
         frames_bw,
+        negatives,
+        negatives_bw,
         roi,
         cohesion,
         built_at_unix: SystemTime::now()
@@ -277,8 +310,8 @@ pub fn build_reference() -> Result<Reference, String> {
 
 pub fn ensure_dirs() {
     let _ = fs::create_dir_all(EMPTY_DIR);
-    let _ = fs::create_dir_all(BW_DIR);
     let _ = fs::create_dir_all(FULL_DIR);
+    let _ = fs::create_dir_all(BW_DIR);
     let _ = fs::create_dir_all(ALERTS_DIR);
 }
 
@@ -490,92 +523,6 @@ pub fn save_reference_photo(w: u32, h: u32, rgb: &[u8]) -> Result<PathBuf, Strin
     Ok(path)
 }
 
-/// A photo of the silo when it is not empty — used only to estimate
-/// how close a full view can get to the empty threshold.
-pub fn save_full_photo(w: u32, h: u32, rgb: &[u8]) -> Result<PathBuf, String> {
-    ensure_dirs();
-    let ts = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis())
-        .unwrap_or(0);
-    let name = format!("{ts}.jpg");
-    let path = PathBuf::from(FULL_DIR).join(&name);
-    save_rgb_jpeg(path.to_str().unwrap_or("data/tmp_full.jpg"), w, h, rgb)?;
-    Ok(path)
-}
-
-pub fn list_full_samples() -> Vec<SampleMeta> {
-    ensure_dirs();
-    let mut out = samples_in(FULL_DIR, Some(false));
-    out.sort_by(|a, b| {
-        b.captured_ms
-            .cmp(&a.captured_ms)
-            .then(b.file_name.cmp(&a.file_name))
-    });
-    out
-}
-
-/// Highest similarity any full sample scores against the empty reference.
-/// `None` when there are no readable full samples.
-pub fn max_full_similarity(reference: &Reference) -> Option<f32> {
-    let fulls = list_full_samples();
-    if fulls.is_empty() {
-        return None;
-    }
-    let mut worst = None;
-    for meta in fulls {
-        let img = match image::open(&meta.path) {
-            Ok(i) => i.to_rgb8(),
-            Err(_) => continue,
-        };
-        let (w, h) = img.dimensions();
-        let rgb = img.into_raw();
-        let feat = features_in_roi(w, h, &rgb, reference.roi);
-        let feat_bw = bw_features(w, h, &rgb, reference.roi, Some(reference.bw_threshold));
-        let score = reference.similarity_pair(&feat, &feat_bw);
-        worst = Some(worst.map_or(score, |w: f32| w.max(score)));
-    }
-    worst
-}
-
-/// Keep the empty line above the closest full sample by [`FULL_SAMPLE_MARGIN`].
-pub const FULL_SAMPLE_MARGIN: f32 = 0.08;
-
-pub fn enforce_full_sample_floor(base: f32, reference: &Reference) -> f32 {
-    match max_full_similarity(reference) {
-        Some(worst) => base.max(worst + FULL_SAMPLE_MARGIN).clamp(0.50, 0.95),
-        None => base.clamp(0.50, 0.95),
-    }
-}
-
-/// How close the nearest full sample sits to the empty alert line.
-/// None when there are no full samples. 0 = safely below, 1 = would trip.
-pub fn false_empty_risk(reference: &Reference, threshold: f32) -> Option<f32> {
-    let worst = max_full_similarity(reference)?;
-    Some(((worst - (threshold - FULL_SAMPLE_MARGIN)) / (FULL_SAMPLE_MARGIN * 2.0)).clamp(0.0, 1.0))
-}
-
-/// When full samples force the line up, or sit dangerously close to empty cohesion.
-pub fn full_sample_warning(reference: &Reference, base_threshold: f32) -> Option<String> {
-    let worst = max_full_similarity(reference)?;
-    let floor = (worst + FULL_SAMPLE_MARGIN).min(0.95);
-    if floor > base_threshold + 0.005 {
-        Some(format!(
-            "Threshold raised to {:.0}% — a full sample scores {:.0}% (need ≥{:.0}% margin).",
-            floor * 100.0,
-            worst * 100.0,
-            FULL_SAMPLE_MARGIN * 100.0
-        ))
-    } else if worst + FULL_SAMPLE_MARGIN > reference.cohesion {
-        Some(format!(
-            "Full samples score up to {:.0}% — empty and full look alike; retake photos or tighten the region.",
-            worst * 100.0
-        ))
-    } else {
-        None
-    }
-}
-
 pub fn save_alert_evidence(
     w: u32,
     h: u32,
@@ -590,6 +537,9 @@ pub fn save_alert_evidence(
     let (tw, th, pixels) = thumb_from_rgb(w, h, rgb, roi, 320);
     let jpg = PathBuf::from(ALERTS_DIR).join(format!("{unix}.jpg"));
     save_rgb_jpeg(jpg.to_str().unwrap_or("data/tmp_alert.jpg"), tw, th, &pixels)?;
+    // Full camera frame for continuous Empty/Full feedback on Home.
+    let train = PathBuf::from(ALERTS_DIR).join(format!("{unix}_train.jpg"));
+    save_rgb_jpeg(train.to_str().unwrap_or("data/tmp_alert_train.jpg"), w, h, rgb)?;
     let meta = serde_json::json!({
         "unix": unix,
         "match": match_score,
@@ -599,15 +549,15 @@ pub fn save_alert_evidence(
     let json = PathBuf::from(ALERTS_DIR).join(format!("{unix}.json"));
     fs::write(&json, serde_json::to_string_pretty(&meta).unwrap_or_default())
         .map_err(|e| e.to_string())?;
-    // The cloud keeps the history. The Pi only needs the frame on screen.
+    // The cloud keeps the history. The Pi only needs the latest alert on screen.
     if let Ok(rd) = fs::read_dir(ALERTS_DIR) {
         for e in rd.filter_map(|e| e.ok()) {
             let path = e.path();
-            let stem = path
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .and_then(|s| s.parse::<u64>().ok());
-            if stem != Some(unix) {
+            let name = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
+            let keep = name == format!("{unix}.jpg")
+                || name == format!("{unix}.json")
+                || name == format!("{unix}_train.jpg");
+            if !keep {
                 let _ = fs::remove_file(path);
             }
         }
@@ -615,7 +565,7 @@ pub fn save_alert_evidence(
     Ok(jpg)
 }
 
-/// Newest alert evidence jpeg, if any.
+/// Newest alert evidence jpeg (sidebar thumb), if any.
 pub fn latest_alert_evidence() -> Option<PathBuf> {
     let rd = fs::read_dir(ALERTS_DIR).ok()?;
     let mut best: Option<(u64, PathBuf)> = None;
@@ -624,12 +574,138 @@ pub fn latest_alert_evidence() -> Option<PathBuf> {
         if path.extension().and_then(|x| x.to_str()) != Some("jpg") {
             continue;
         }
-        let stem = path.file_stem().and_then(|s| s.to_str())?.parse::<u64>().ok()?;
-        if best.as_ref().map(|(t, _)| stem > *t).unwrap_or(true) {
-            best = Some((stem, path));
+        let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        // Skip `{unix}_train.jpg` — only the UI thumb is `{unix}.jpg`.
+        // Must `continue` (not `?`): a failed parse used to abort the whole
+        // scan and Home Empty/Full then failed with "no alert to label".
+        let Some(unix) = stem.parse::<u64>().ok() else {
+            continue;
+        };
+        if best.as_ref().map(|(t, _)| unix > *t).unwrap_or(true) {
+            best = Some((unix, path));
         }
     }
     best.map(|(_, p)| p)
+}
+
+/// Operator feedback on the newest alert: `Some(true)` = Empty, `Some(false)` = Full.
+pub fn latest_alert_feedback() -> Option<bool> {
+    let path = latest_alert_evidence()?;
+    let unix = path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .and_then(|s| s.parse::<u64>().ok())?;
+    let json = PathBuf::from(ALERTS_DIR).join(format!("{unix}.json"));
+    let s = fs::read_to_string(json).ok()?;
+    let v: serde_json::Value = serde_json::from_str(&s).ok()?;
+    match v.get("feedback").and_then(|x| x.as_str()) {
+        Some("empty") => Some(true),
+        Some("full") => Some(false),
+        _ => None,
+    }
+}
+
+/// Promote the newest alert frame into Empty or Full and rebuild later.
+///
+/// Returns the path of the new library photo.
+pub fn label_alert_evidence(empty: bool) -> Result<PathBuf, String> {
+    let thumb = latest_alert_evidence().ok_or_else(|| "no alert to label".to_string())?;
+    label_alert_at(&thumb, empty)
+}
+
+/// Promote a specific alert thumb (and its `{unix}_train.jpg`) into the library.
+pub fn label_alert_at(thumb: &Path, empty: bool) -> Result<PathBuf, String> {
+    ensure_dirs();
+    let unix = thumb
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .and_then(|s| s.parse::<u64>().ok())
+        .ok_or_else(|| "bad alert filename".to_string())?;
+
+    let json_path = PathBuf::from(ALERTS_DIR).join(format!("{unix}.json"));
+    // Allow one label per alert. Re-tapping the same choice is a no-op message.
+    if let Ok(s) = fs::read_to_string(&json_path) {
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&s) {
+            match v.get("feedback").and_then(|x| x.as_str()) {
+                Some("empty") if empty => {
+                    return Err("already saved as Empty".into());
+                }
+                Some("full") if !empty => {
+                    return Err("already saved as Full".into());
+                }
+                Some(prev) => {
+                    // Changed mind: remove the previous library file, then re-label.
+                    if let Some(name) = v.get("labeled_file").and_then(|x| x.as_str()) {
+                        let old = if prev == "empty" {
+                            PathBuf::from(EMPTY_DIR).join(name)
+                        } else {
+                            PathBuf::from(FULL_DIR).join(name)
+                        };
+                        let _ = delete_sample(&old);
+                    }
+                }
+                None => {}
+            }
+        }
+    }
+
+    let train = PathBuf::from(ALERTS_DIR).join(format!("{unix}_train.jpg"));
+    let source = if train.is_file() {
+        train
+    } else {
+        return Err("no full alert frame on disk — wait for the next alert".into());
+    };
+    let img = image::open(&source)
+        .map_err(|e| format!("open alert frame: {e}"))?
+        .to_rgb8();
+    let (w, h) = img.dimensions();
+    let rgb = img.into_raw();
+
+    let ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let name = format!("{ts}.jpg");
+    let dest_dir = if empty { EMPTY_DIR } else { FULL_DIR };
+    let dest = PathBuf::from(dest_dir).join(&name);
+    save_rgb_jpeg(dest.to_str().unwrap_or("data/tmp.jpg"), w, h, &rgb)?;
+
+    // Colour + B&W for Config library and Supabase reference rows.
+    let roi = load_region();
+    let (bw, bh, pixels) = bw_from_rgb(w, h, &rgb, roi, None);
+    let bw_path = bw_path_for(&name);
+    save_rgb_jpeg(
+        bw_path.to_str().unwrap_or("data/tmp_bw.jpg"),
+        bw,
+        bh,
+        &pixels,
+    )?;
+
+    let mut meta = if let Ok(s) = fs::read_to_string(&json_path) {
+        serde_json::from_str::<serde_json::Value>(&s).unwrap_or_else(|_| serde_json::json!({}))
+    } else {
+        serde_json::json!({})
+    };
+    if let Some(obj) = meta.as_object_mut() {
+        obj.insert(
+            "feedback".into(),
+            serde_json::Value::String(if empty { "empty" } else { "full" }.into()),
+        );
+        obj.insert(
+            "labeled_file".into(),
+            serde_json::Value::String(name.clone()),
+        );
+    }
+    fs::write(
+        &json_path,
+        serde_json::to_string_pretty(&meta).unwrap_or_default(),
+    )
+    .map_err(|e| e.to_string())?;
+
+    // Return the relative library path Config uses (not a canonical absolute).
+    Ok(dest)
 }
 
 /// The black-and-white twin of a stored reference photo.
@@ -646,16 +722,64 @@ pub struct SampleMeta {
     pub captured_ms: Option<u64>,
 }
 
-/// Every reference photo on disk, newest first.
+/// Empty-silo photos only — these build the match reference.
+pub fn list_empty_references() -> Vec<SampleMeta> {
+    ensure_dirs();
+    let mut out = samples_in(EMPTY_DIR, Some(true));
+    sort_samples_newest_first(&mut out);
+    out
+}
+
+/// Every library photo (Empty + Not empty), newest first.
 pub fn list_references() -> Vec<SampleMeta> {
     ensure_dirs();
     let mut out = samples_in(EMPTY_DIR, Some(true));
+    out.extend(samples_in(FULL_DIR, Some(false)));
+    sort_samples_newest_first(&mut out);
+    out
+}
+
+fn sort_samples_newest_first(out: &mut [SampleMeta]) {
     out.sort_by(|a, b| {
         b.captured_ms
             .cmp(&a.captured_ms)
             .then(b.file_name.cmp(&a.file_name))
     });
-    out
+}
+
+/// Move a photo between Empty and Not empty. Colour file moves; B&W twin stays.
+pub fn set_sample_empty(path: &Path, empty: bool) -> Result<PathBuf, String> {
+    let canon = path
+        .canonicalize()
+        .map_err(|e| format!("resolve image: {e}"))?;
+    let empty_root = Path::new(EMPTY_DIR)
+        .canonicalize()
+        .map_err(|e| format!("empty dir: {e}"))?;
+    let full_root = Path::new(FULL_DIR)
+        .canonicalize()
+        .or_else(|_| {
+            ensure_dirs();
+            Path::new(FULL_DIR).canonicalize()
+        })
+        .map_err(|e| format!("full dir: {e}"))?;
+
+    let in_empty = canon.starts_with(&empty_root);
+    let in_full = canon.starts_with(&full_root);
+    if !in_empty && !in_full {
+        return Err("refusing to move outside dataset folders".into());
+    }
+    let already = (empty && in_empty) || (!empty && in_full);
+    if already {
+        return Ok(canon);
+    }
+    let name = canon
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or_else(|| "bad filename".to_string())?;
+    let dest_dir = if empty { EMPTY_DIR } else { FULL_DIR };
+    let dest = PathBuf::from(dest_dir).join(name);
+    fs::rename(&canon, &dest).map_err(|e| format!("relabel failed: {e}"))?;
+    dest.canonicalize().or(Ok(dest))
 }
 
 #[derive(Clone)]

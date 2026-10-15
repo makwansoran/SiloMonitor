@@ -1,6 +1,6 @@
 [Unit]
 Description=Industrial Smart System — silo empty monitoring
-# The plant loop does not need the desktop. X11 is only the operator window.
+# The plant loop does not need the desktop. The operator window uses Xwayland when present.
 After=network-online.target
 Wants=network-online.target
 
@@ -10,10 +10,12 @@ User=spectr
 WorkingDirectory=/home/spectr/silo-alert
 EnvironmentFile=-/home/spectr/silo-alert/.env
 Environment=DISPLAY=:0
+Environment=WAYLAND_DISPLAY=wayland-0
 Environment=XDG_RUNTIME_DIR=/run/user/1000
+# Xwayland — native Wayland froze the pointer under labwc / Pi Connect.
 Environment=WINIT_UNIX_BACKEND=x11
 
-# Keep the panel awake when a desktop exists. Failure is fine headless.
+# Keep the panel awake when an Xwayland display exists. Failure is fine headless.
 ExecStartPre=-/usr/bin/xset -display :0 s off
 ExecStartPre=-/usr/bin/xset -display :0 s noblank
 ExecStartPre=-/usr/bin/xset -display :0 -dpms
